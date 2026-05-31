@@ -47,19 +47,19 @@ def analyze_gap_candidates(tickers):
             
             # Logic boundaries for identifying Gap Ups / Gap Downs
             if expected_gap_pct > 0.4 or (close_position > 0.85 and rel_volume > 1.3):
-                prediction = "Potential GAP UP"
+                prediction = "GAP UP"
                 confidence = "High" if expected_gap_pct > 0.8 else "Medium"
             elif expected_gap_pct < -0.4 or (close_position < 0.15 and rel_volume > 1.3):
-                prediction = "Potential GAP DOWN"
+                prediction = "GAP DOWN"
                 confidence = "High" if expected_gap_pct < -0.8 else "Medium"
                 
             gap_data.append({
                 "Ticker": ticker.replace(".NS", ""),
                 "Prev Close": round(close, 2),
-                "Pre-Mkt Price": round(live_price, 2),
-                "Expected Gap %": round(expected_gap_pct, 2),
+                "Pre-Mkt": round(live_price, 2),
+                "Gap %": round(expected_gap_pct, 2),
                 "Rel Vol": round(rel_volume, 2),
-                "Prediction": prediction,
+                "Direction": prediction,
                 "Confidence": confidence
             })
             
@@ -69,31 +69,53 @@ def analyze_gap_candidates(tickers):
     return pd.DataFrame(gap_data)
 
 if __name__ == "__main__":
-    # Check if a specific ticker argument was passed via command line
-    # Usage: python scanner.py WIPRO.NS
-    if len(sys.argv) > 1:
+    if len(sys.argv) > 1 and sys.argv[1].strip() != '':
         target_ticker = sys.argv[1].upper()
-        # Append .NS automatically if you forget to provide it
         if not target_ticker.endswith(".NS") and not target_ticker.endswith(".BO"):
             target_ticker += ".NS"
         ticker_universe = [target_ticker]
-        print(f"--- Running Targeted Scan For: {target_ticker} ---")
+        print(f"--- 🎯 Targeted Scan Activated For: {target_ticker} ---")
     else:
-        # Default Expanded Universe: 20 Blue-chip Indian Market Movers
         ticker_universe = [
             "RELIANCE.NS", "TCS.NS", "INFY.NS", "HDFCBANK.NS", "ICICIBANK.NS",
             "SBIN.NS", "BHARTIARTL.NS", "ITC.NS", "LTIM.NS", "HINDUNILVR.NS",
             "LT.NS", "AXISBANK.NS", "KOTAKBANK.NS", "BAJFINANCE.NS", "M&M.NS",
             "MARUTI.NS", "SUNPHARMA.NS", "ADANIENT.NS", "TATAMOTORS.NS", "WIPRO.NS"
         ]
-        print(f"--- Running Bulk Indian Market Pre-Market Scan ({len(ticker_universe)} tickers) ---")
+        print(f"--- 📊 Running Bulk Pre-Market Scan ({len(ticker_universe)} Items) ---")
     
-    results = analyze_gap_candidates(ticker_universe)
+    df_results = analyze_gap_candidates(ticker_universe)
     
-    # Sort results by the size of the expected gap edge
-    if not results.empty:
-        results = results.sort_values(by="Expected Gap %", ascending=False)
-        print("\n[SCAN RESULTS]")
-        print(results.to_string(index=False))
-    else:
-        print("\nNo data retrieved.")
+    if df_results.empty:
+        print("❌ No market numbers retrieved.")
+        sys.exit()
+
+    # Sort sequentially by raw gap edge magnitude
+    df_results = df_results.sort_values(by="Gap %", ascending=False)
+    
+    # Segment data for grouped rendering
+    gap_ups = df_results[df_results['Direction'] == 'GAP UP']
+    gap_downs = df_results[df_results['Direction'] == 'GAP DOWN']
+    neutrals = df_results[df_results['Direction'] == 'Neutral']
+    
+    # --- Clean Display Presentation Block ---
+    print("\n" + "="*65)
+    print("      🟢 PRE-MARKET OPENING MOMENTUM RADAR (8:45 AM IST)      ")
+    print("="*65)
+    
+    if not gap_ups.empty:
+        print("\n🔥 [POTENTIAL GAP UP CANDIDATES]")
+        for _, row in gap_ups.iterrows():
+            print(f"  ▲ {row['Ticker']:<12} | Est. Gap: {row['Gap %']:>+6}% | Vol Momentum: {row['Rel Vol']}x | Confidence: {row['Confidence']}")
+            
+    if not gap_downs.empty:
+        print("\n🚨 [POTENTIAL GAP DOWN CANDIDATES]")
+        for _, row in gap_downs.iterrows():
+            print(f"  ▼ {row['Ticker']:<12} | Est. Gap: {row['Gap %']:>+6}% | Vol Momentum: {row['Rel Vol']}x | Confidence: {row['Confidence']}")
+            
+    if not neutrals.empty:
+        print("\n💤 [NEUTRAL STABILITY ZONE]")
+        for _, row in neutrals.iterrows():
+            print(f"  • {row['Ticker']:<12} | Est. Gap: {row['Gap %']:>+6}% | Prev Close: {row['Prev Close']}")
+            
+    print("\n" + "="*65)
