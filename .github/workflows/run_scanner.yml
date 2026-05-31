@@ -4,7 +4,12 @@ on:
   schedule:
     # 8:45 AM IST converts to 3:15 AM UTC (Monday to Friday)
     - cron: '15 3 * * 1-5'
-  workflow_dispatch: # Allows manual trigger via GitHub UI
+  workflow_dispatch:
+    inputs:
+      ticker:
+        description: 'Optional: Enter a specific ticker to scan (e.g., WIPRO, RELIANCE)'
+        required: false
+        default: ''
 
 jobs:
   run-scanner:
@@ -25,4 +30,4 @@ jobs:
         pip install yfinance pandas
 
     - name: Run Gap Predictor Script
-      run: python scanner.py
+      run: python scanner.py ${{ github.event.inputs.ticker }}
