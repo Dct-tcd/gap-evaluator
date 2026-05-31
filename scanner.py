@@ -1,3 +1,4 @@
+import sys
 import yfinance as yf
 import pandas as pd
 
@@ -68,17 +69,31 @@ def analyze_gap_candidates(tickers):
     return pd.DataFrame(gap_data)
 
 if __name__ == "__main__":
-    # Indian market universe (Add/remove Nifty tickers here)
-    ticker_universe = [
-        "RELIANCE.NS", "TCS.NS", "INFY.NS", "HDFCBANK.NS", 
-        "ICICIBANK.NS", "SBIN.NS", "BHARTIARTL.NS"
-    ]
+    # Check if a specific ticker argument was passed via command line
+    # Usage: python scanner.py WIPRO.NS
+    if len(sys.argv) > 1:
+        target_ticker = sys.argv[1].upper()
+        # Append .NS automatically if you forget to provide it
+        if not target_ticker.endswith(".NS") and not target_ticker.endswith(".BO"):
+            target_ticker += ".NS"
+        ticker_universe = [target_ticker]
+        print(f"--- Running Targeted Scan For: {target_ticker} ---")
+    else:
+        # Default Expanded Universe: 20 Blue-chip Indian Market Movers
+        ticker_universe = [
+            "RELIANCE.NS", "TCS.NS", "INFY.NS", "HDFCBANK.NS", "ICICIBANK.NS",
+            "SBIN.NS", "BHARTIARTL.NS", "ITC.NS", "LTIM.NS", "HINDUNILVR.NS",
+            "LT.NS", "AXISBANK.NS", "KOTAKBANK.NS", "BAJFINANCE.NS", "M&M.NS",
+            "MARUTI.NS", "SUNPHARMA.NS", "ADANIENT.NS", "TATAMOTORS.NS", "WIPRO.NS"
+        ]
+        print(f"--- Running Bulk Indian Market Pre-Market Scan ({len(ticker_universe)} tickers) ---")
     
-    print("--- Running Indian Market Pre-Market Scan (8:45 AM IST) ---")
     results = analyze_gap_candidates(ticker_universe)
     
-    # Sort by the highest expected gaps
-    results = results.sort_values(by="Expected Gap %", ascending=False)
-    
-    print("\n[FULL SCAN RESULTS]")
-    print(results.to_string(index=False))
+    # Sort results by the size of the expected gap edge
+    if not results.empty:
+        results = results.sort_values(by="Expected Gap %", ascending=False)
+        print("\n[SCAN RESULTS]")
+        print(results.to_string(index=False))
+    else:
+        print("\nNo data retrieved.")
