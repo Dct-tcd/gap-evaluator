@@ -60,6 +60,25 @@ def send_telegram_alert(df):
         print("⚠️ Missing Telegram environment configuration. Skipping alert.")
         return
 
+    # --- 🛰️ LIVE DIAGNOSTIC PING BLOCK ---
+    print("\n📡 Initiating API Diagnostic Ping...")
+    ping_url = f"https://api.telegram.org/bot{bot_token}/getMe"
+    try:
+        ping_response = requests.get(ping_url)
+        if ping_response.status_code == 200:
+            bot_info = ping_response.json()
+            print(f"✅ Connection Stable! Authenticated as Bot: @{bot_info['result']['username']}")
+        elif ping_response.status_code == 404:
+            print("❌ Diagnostic Failed: HTTP 404 Not Found.")
+            print("👉 CRITICAL: Your TELEGRAM_BOT_TOKEN is invalid. Check for typos or extra spaces in your GitHub Secrets.")
+            return
+        else:
+            print(f"⚠️ Unexpected Ping Response ({ping_response.status_code}): {ping_response.text}")
+    except Exception as e:
+        print(f"❌ Network Level Failure connecting to Telegram: {e}")
+        return
+    # -------------------------------------
+
     # Build a clean plain text table using HTML pre-formatting tag
     message = "🎯 <b>INTRADAY RANGE FORECAST (68% Prob)</b>\n"
     message += "===================================\n"
@@ -87,8 +106,9 @@ def send_telegram_alert(df):
         if response.status_code == 200:
             print("⚡ Telegram range notification pinged successfully.")
         else:
-            print(f"❌ Telegram API returned an error: {response.text}")
-            print("👉 Check that your TELEGRAM_BOT_TOKEN secret doesn't have the word 'bot' pasted twice.")
+            print(f"\n❌ Core Alert Transmission Failed (Status Code: {response.status_code})")
+            print(f"Response Payload: {response.text}")
+            print("👉 If the connection ping passed above but this failed, your TELEGRAM_CHAT_ID is wrong, or you forgot to hit /start in the chat with your bot.")
     except Exception as e:
         print(f"❌ HTTP request to Telegram failed: {e}")
 
