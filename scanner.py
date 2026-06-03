@@ -1,9 +1,9 @@
+import os
 import sys
 import numpy as np
 import yfinance as yf
 import pandas as pd
 import requests
-import os
 
 def predict_stock_range(tickers):
     range_data = []
@@ -60,8 +60,8 @@ def send_telegram_alert(df):
         print("⚠️ Missing Telegram environment configuration. Skipping alert.")
         return
 
-    # Build a clean mobile-friendly plain text message block
-    message = "🎯 *INTRADAY RANGE FORECAST (68% Prob)*\n"
+    # Build a clean plain text table using HTML pre-formatting tag
+    message = "🎯 <b>INTRADAY RANGE FORECAST (68% Prob)</b>\n"
     message += "===================================\n"
     message += f"{'Ticker':<10} | {'Low':<8} | {'High':<8} | {'Swing'}\n"
     message += "-----------------------------------\n"
@@ -70,13 +70,16 @@ def send_telegram_alert(df):
         message += f"{row['Ticker']:<10} | {int(row['Low']):<8,} | {int(row['High']):<8,} | ±{row['Swing']}%\n"
         
     message += "===================================\n"
-    message += "_MAPPED VIA LOG RETURNS ALGORITHMIC SCAN_"
+    message += "<i>MAPPED VIA LOG RETURNS ALGORITHMIC SCAN</i>"
+
+    # Wrap the entire string in HTML <pre> tags to lock monospace spacing without breaking characters
+    formatted_text = f"<pre>{message}</pre>"
 
     url = f"https://api.telegram.org/bot{bot_token}/sendMessage"
     payload = {
         "chat_id": chat_id,
-        "text": f"```\n{message}\n```",  # Monospace code-block markdown wrapper
-        "parse_mode": "MarkdownV2"
+        "text": formatted_text,
+        "parse_mode": "HTML"
     }
     
     try:
@@ -85,6 +88,7 @@ def send_telegram_alert(df):
             print("⚡ Telegram range notification pinged successfully.")
         else:
             print(f"❌ Telegram API returned an error: {response.text}")
+            print("👉 Check that your TELEGRAM_BOT_TOKEN secret doesn't have the word 'bot' pasted twice.")
     except Exception as e:
         print(f"❌ HTTP request to Telegram failed: {e}")
 
