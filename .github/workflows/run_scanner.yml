@@ -1,36 +1,46 @@
-name: Daily Stock Gap Scanner
+name: Run Algorithmic Scanner
 
 on:
-  schedule:
-    # 8:45 AM IST converts to 3:15 AM UTC (Monday to Friday)
-    - cron: '15 3 * * 1-5'
+  # This configuration line allows your Cloudflare Worker to trigger this workflow dynamically
+  repository_dispatch:
+    types: [telegram_trigger]
+    
+  # Keeps the manual run button active in your GitHub UI just in case
   workflow_dispatch:
     inputs:
       ticker:
-        description: 'Optional: Enter a specific ticker to scan (e.g., WIPRO, RELIANCE)'
+        description: 'Target Ticker Symbol (e.g. WIPRO)'
         required: false
         default: ''
 
 jobs:
-  run-scanner:
+  scan:
     runs-on: ubuntu-latest
-
     steps:
-    - name: Checkout Repository
+    - name: Checkout Repository Code
       uses: actions/checkout@v4
 
-    - name: Set up Python
+    - name: Set Up Python Runtime
       uses: actions/setup-python@v5
       with:
-        python-version: '3.10'
+        python-python: '3.10'
+        cache: 'pip'
 
-    - name: Install Dependencies
+    - name: Install System Dependencies
       run: |
-        python -m pip install --upgrade pip
-        pip install yfinance pandas numpy requests
+        pip install numpy pandas yfinance requests
 
-    - name: Run Gap Predictor Script
+    - name: Run Processing Engine
       env:
         TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
         TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
-      run: python scanner.py ${{ github.event.inputs.ticker }}
+      run: |
+        # Check if triggered via Cloudflare Webhook Dispatch vs Manual UI button Click
+        if [ "${{ github.event_name }}" = "repository_dispatch" ]; then
+          TICKER_INPUT="${{ github.event.client_payload.ticker }}"
+        else
+          TICKER_INPUT="${{ github.event.inputs.ticker }}"
+        fi
+        
+        # Execute your core scanner script passing the parsed asset input parameter
+        python scanner.py "$TICKER_INPUT"
