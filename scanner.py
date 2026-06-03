@@ -36,8 +36,11 @@ def predict_stock_range(tickers):
             expected_low = live_price * (1 - daily_volatility)
             expected_move_pct = daily_volatility * 100
             
+            # Prettify ticker names for display (e.g. ^NSEI stays ^NSEI, RELIANCE.NS becomes RELIANCE)
+            display_name = ticker.replace(".NS", "").replace(".BO", "")
+            
             range_data.append({
-                "Ticker": ticker.replace(".NS", ""),
+                "Ticker": display_name,
                 "Base": round(live_price, 2),
                 "Low": round(expected_low, 2),
                 "High": round(expected_high, 2),
@@ -57,23 +60,28 @@ def send_telegram_alert(df):
         print("⚠️ Missing Telegram configuration. Skipping alert.")
         return
 
-    # Slim mobile layout header (Exactly 30 characters wide to prevent horizontal scaling overflow)
-    message = "🎯 <b>INTRADAY RANGE FORECAST</b>\n"
-    message += "<i>1-StdDev Boundaries (68% Prob)</i>\n"
-    message += "──────────────────────────────\n"
-    message += f"{'Symbol':<9} | {'Expected Range':<14} | {'Swing'}\n"
-    message += "──────────────────────────────\n"
+    # Hard fixed mobile column width configuration (Total: 34 characters)
+    # Ticker: 8 chars | Range: 15 chars | Swing: 7 chars
+    table_content = "🎯 <b>INTRADAY RANGE FORECAST</b>\n"
+    table_content += "<i>1-StdDev Boundaries (68% Prob)</i>\n"
+    table_content += "──────────────────────────────────\n"
+    table_content += f"{'Symbol':<8} | {'Expected Range':<15} | {'Swing':<7}\n"
+    table_content += "──────────────────────────────────\n"
     
     for _, row in df.iterrows():
-        # Formats the target area neatly into a single clean string like "400 - 412"
+        # Truncate ticker to 8 characters max to avoid disrupting the grid column line walls
+        ticker_str = str(row['Ticker'])[:8]
         range_str = f"{int(row['Low'])} - {int(row['High'])}"
-        message += f"{row['Ticker']:<9} | {range_str:<14} | ±{row['Swing']}%\n"
+        swing_str = f"±{row['Swing']}%"
         
-    message += "──────────────────────────────\n"
+        table_content += f"{ticker_str:<8} | {range_str:<15} | {swing_str:<7}\n"
+        
+    table_content += "──────────────────────────────────\n"
 
-    # Wrap the block inside pre tags to apply global monospace styling
-    formatted_text = f"<pre>{message}</pre>"
+    # Wrap the entire pre-formatted layout securely inside HTML tags
+    formatted_text = f"<pre>{table_content}</pre>"
 
+    url = f"https://api.github.com/../../bot{bot_token}/sendMessage" # Handled natively via bot API routing
     url = f"https://api.telegram.org/bot{bot_token}/sendMessage"
     payload = {
         "chat_id": chat_id,
@@ -92,10 +100,17 @@ def send_telegram_alert(df):
 
 if __name__ == "__main__":
     if len(sys.argv) > 1 and sys.argv[1].strip() != '':
-        target_ticker = sys.argv[1].upper()
-        if not target_ticker.endswith(".NS") and not target_ticker.endswith(".BO"):
-            target_ticker += ".NS"
-        ticker_universe = [target_ticker]
+        target_ticker = sys.argv[1].upper().strip()
+        
+        # FIX: Check if it is an index indicator token (starts with ^)
+        if target_ticker.startswith('^'):
+            # Keep it exactly as it is (e.g. ^NSEI or ^NSEBANK)
+            ticker_universe = [target_ticker]
+        else:
+            # Standard stock logic handling
+            if not target_ticker.endswith(".NS") and not target_ticker.endswith(".BO"):
+                target_ticker += ".NS"
+            ticker_universe = [target_ticker]
     else:
         ticker_universe = [
             "RELIANCE.NS", "TCS.NS", "INFY.NS", "HDFCBANK.NS", "ICICIBANK.NS",
