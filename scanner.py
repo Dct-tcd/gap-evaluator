@@ -89,7 +89,12 @@ if __name__ == "__main__":
     print("-"*72)
     
     for _, row in df_results.iterrows():
-        print(f"{row['Ticker']:<12} | {row['Current/Pre-Mkt']:<12,2f} | {row['Expected Low']:<14,2f} | {row['Expected High']:<14,2f} | ±{row['Expected Move %']}%")
+        # Formatted string variables to handle clean commas for larger numbers without crashing
+        base_str = f"{row['Current/Pre-Mkt']:,}"
+        low_str = f"{row['Expected Low']:,}"
+        high_str = f"{row['Expected High']:,}"
+        
+        print(f"{row['Ticker']:<12} | {base_str:<12} | {low_str:<14} | {high_str:<14} | ±{row['Expected Move %']}%")
         
     print("="*72)
     print("Statistically, the security price is expected to stay inside this range tomorrow.")
