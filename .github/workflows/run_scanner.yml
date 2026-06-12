@@ -4,7 +4,7 @@ on:
   # This configuration line allows your Cloudflare Worker to trigger this workflow dynamically
   repository_dispatch:
     types: [telegram_trigger]
-    
+
   # Keeps the manual run button active in your GitHub UI just in case
   workflow_dispatch:
     inputs:
@@ -23,24 +23,36 @@ jobs:
     - name: Set Up Python Runtime
       uses: actions/setup-python@v5
       with:
-        python-python: '3.10'
+        python-version: '3.10'
         cache: 'pip'
 
     - name: Install System Dependencies
       run: |
-        pip install numpy pandas yfinance requests
+        pip install numpy pandas yfinance requests scipy
 
     - name: Run Processing Engine
       env:
         TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
         TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+        # Safely assign inputs inside environment variables to prevent template parsing errors
+        DISPATCH_TICKER: ${{ github.event.client_payload.ticker }}
+        MANUAL_TICKER: ${{ github.event.inputs.ticker }}
       run: |
-        # Check if triggered via Cloudflare Webhook Dispatch vs Manual UI button Click
-        if [ "${{ github.event_name }}" = "repository_dispatch" ]; then
-          TICKER_INPUT="${{ github.event.client_payload.ticker }}"
+        # Fallback evaluation to capture the target token based on execution context
+        if [ -n "$DISPATCH_TICKER" ]; then
+          TICKER_INPUT="$DISPATCH_TICKER"
         else
-          TICKER_INPUT="${{ github.event.inputs.ticker }}"
+          TICKER_INPUT="$MANUAL_TICKER"
         fi
-        
-        # Execute your core scanner script passing the parsed asset input parameter
-        python scanner.py "$TICKER_INPUT"
+
+        # Force uppercase and remove leading/trailing spaces
+        CLEANED_INPUT=$(echo "$TICKER_INPUT" | tr '[:lower:]' '[:upper:]' | xargs)
+
+        # Dynamic Route Controller Optimization
+        if [ "$CLEANED_INPUT" = "NIFTY" ] || [ "$CLEANED_INPUT" = "BANKNIFTY" ] || [ "$CLEANED_INPUT" = "FINNIFTY" ]; then
+          echo "⚡ High-Value Index Detected. Initiating LTP Options Singularity Matrix Calculator Engine..."
+          python options_scanner.py "$CLEANED_INPUT"
+        else
+          echo "📉 Equity Ticker Detected. Initiating 1-StdDev Boundary Prediction Engine..."
+          python scanner.py "$CLEANED_INPUT"
+        fi
