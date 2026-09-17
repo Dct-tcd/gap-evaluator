@@ -1,11 +1,10 @@
 name: Run Algorithmic Scanner
 
 on:
-  # This configuration line allows your Cloudflare Worker to trigger this workflow dynamically
+
   repository_dispatch:
     types: [telegram_trigger]
 
-  # Keeps the manual run button active in your GitHub UI just in case
   workflow_dispatch:
     inputs:
       ticker:
@@ -14,45 +13,125 @@ on:
         default: ''
 
 jobs:
+
   scan:
+
     runs-on: ubuntu-latest
+
     steps:
+
+    # =====================================================
+    # CHECKOUT
+    # =====================================================
+
     - name: Checkout Repository Code
       uses: actions/checkout@v4
 
+
+    # =====================================================
+    # PYTHON
+    # =====================================================
+
     - name: Set Up Python Runtime
       uses: actions/setup-python@v5
+
       with:
         python-version: '3.10'
-        # ❌ Removed cache: 'pip' to prevent looking for missing requirements.txt files
 
-    - name: Install System Dependencies
+
+    # =====================================================
+    # DEPENDENCIES
+    # =====================================================
+
+    - name: Install Dependencies
+
       run: |
-        pip install numpy pandas yfinance requests scipy
 
-    - name: Run Processing Engine
+        python -m pip install --upgrade pip
+
+        pip install \
+          numpy \
+          pandas \
+          yfinance \
+          requests \
+          scipy \
+          google-genai
+
+
+    # =====================================================
+    # DETERMINE TICKER
+    # =====================================================
+
+    - name: Determine Ticker
+
       env:
-        TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
-        TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
-        # Safely assign inputs inside environment variables to prevent template parsing errors
+
         DISPATCH_TICKER: ${{ github.event.client_payload.ticker }}
+
         MANUAL_TICKER: ${{ github.event.inputs.ticker }}
+
       run: |
-        # Fallback evaluation to capture the target token based on execution context
+
         if [ -n "$DISPATCH_TICKER" ]; then
+
           TICKER_INPUT="$DISPATCH_TICKER"
+
         else
+
           TICKER_INPUT="$MANUAL_TICKER"
+
         fi
 
-        # Force uppercase and remove leading/trailing spaces
-        CLEANED_INPUT=$(echo "$TICKER_INPUT" | tr '[:lower:]' '[:upper:]' | xargs)
 
-        # Dynamic Route Controller Optimization
-        if [ "$CLEANED_INPUT" = "NIFTY" ] || [ "$CLEANED_INPUT" = "BANKNIFTY" ] || [ "$CLEANED_INPUT" = "FINNIFTY" ]; then
-          echo "⚡ High-Value Index Detected. Initiating LTP Options Singularity Matrix Calculator Engine..."
-          python options_scanner.py "$CLEANED_INPUT"
+        CLEANED_INPUT=$(
+          echo "$TICKER_INPUT" |
+          tr '[:lower:]' '[:upper:]' |
+          xargs
+        )
+
+
+        if [ -z "$CLEANED_INPUT" ]; then
+
+          echo "ERROR: No ticker supplied."
+
+          exit 1
+
+        fi
+
+
+        echo "TICKER=$CLEANED_INPUT" >> "$GITHUB_ENV"
+
+        echo "Target ticker: $CLEANED_INPUT"
+
+
+    # =====================================================
+    # RUN SCANNER
+    # =====================================================
+
+    - name: Run Processing Engine
+
+      env:
+
+        TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+
+        TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+
+        GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+
+      run: |
+
+        if [ "$TICKER" = "NIFTY" ] || \
+           [ "$TICKER" = "BANKNIFTY" ] || \
+           [ "$TICKER" = "FINNIFTY" ]; then
+
+          echo "⚡ High-Value Index Detected."
+
+          python scanner.py "$TICKER"
+
         else
-          echo "📉 Equity Ticker Detected. Initiating 1-StdDev Boundary Prediction Engine..."
-          python scanner.py "$CLEANED_INPUT"
+
+          echo "📉 Equity Ticker Detected."
+
+          python scanner.py "$TICKER"
+
         fi
