@@ -953,4 +953,4 @@ if __name__ == "__main__":
         ai_message = (
             "🤖 GEMINI MARKET INTELLIGENCE\n"
             f"{target_asset}\n"
-            "──────────────────────────
+            "──────────────────────────"
