@@ -39,10 +39,9 @@ jobs:
       # DEPENDENCIES
       # ==========================================
 
-      - name: Install Dependencies
-        run: |
-          python -m pip install --upgrade pip
-          pip install numpy pandas yfinance requests scipy google-genai
+      - name: Install System Dependencies
+  run: |
+    pip install numpy pandas yfinance requests scipy curl_cffi google-genai
 
 
       # ==========================================
