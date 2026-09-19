@@ -1,90 +1,69 @@
-name: Daily Workday Job Scanner
+name: Run Investor Engine
 
 on:
-  schedule:
-    # 9:00 AM IST = 03:30 UTC
-    - cron: "30 3 * * *"
+  repository_dispatch:
+    types:
+      - telegram_trigger
 
-  # Allows you to manually run it from GitHub Actions
   workflow_dispatch:
-
-permissions:
-  actions: write
-  contents: read
+    inputs:
+      ticker:
+        description: "Stock ticker (e.g. RELIANCE, TCS, INFY)"
+        required: false
+        default: "RELIANCE"
 
 jobs:
-  scan:
+  analyze:
     runs-on: ubuntu-latest
 
     steps:
-      # ------------------------------------------------------
-      # Checkout
-      # ------------------------------------------------------
-
-      - name: Checkout repository
+      - name: Checkout Repository Code
         uses: actions/checkout@v4
 
-      # ------------------------------------------------------
-      # Python
-      # ------------------------------------------------------
-
-      - name: Setup Python
+      - name: Set Up Python Runtime
         uses: actions/setup-python@v5
         with:
-          python-version: "3.11"
+          python-version: "3.10"
 
-      # ------------------------------------------------------
-      # Dependencies
-      # ------------------------------------------------------
-
-      - name: Install dependencies
+      - name: Install Dependencies
         run: |
           python -m pip install --upgrade pip
-          pip install -r requirements.txt
+          pip install \
+            numpy \
+            pandas \
+            requests \
+            yfinance \
+            google-genai
 
-      # ------------------------------------------------------
-      # Restore previous SQLite database
-      # ------------------------------------------------------
+      - name: Determine Ticker
+        id: ticker
+        env:
+          DISPATCH_TICKER: ${{ github.event.client_payload.ticker }}
+          MANUAL_TICKER: ${{ inputs.ticker }}
+        run: |
+          if [ -n "$DISPATCH_TICKER" ]; then
+            TICKER_INPUT="$DISPATCH_TICKER"
+          else
+            TICKER_INPUT="$MANUAL_TICKER"
+          fi
 
-      - name: Restore jobs database
-        uses: actions/download-artifact@v4
-        with:
-          name: workday-jobs-db
-          path: .
-        continue-on-error: true
+          CLEANED_INPUT=$(echo "$TICKER_INPUT" | tr '[:lower:]' '[:upper:]' | xargs)
 
-      # ------------------------------------------------------
-      # Run scanner
-      # ------------------------------------------------------
+          if [ -z "$CLEANED_INPUT" ]; then
+            CLEANED_INPUT="RELIANCE"
+          fi
 
-      - name: Run Workday scanner
+          echo "ticker=$CLEANED_INPUT" >> "$GITHUB_OUTPUT"
+          echo "TICKER: $CLEANED_INPUT"
+
+      - name: Run Investor Engine
         env:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
         run: |
-          python scanner.py
+          TICKER="${{ steps.ticker.outputs.ticker }}"
 
-      # ------------------------------------------------------
-      # Save updated database
-      # ------------------------------------------------------
+          echo "Starting investor analysis for $TICKER..."
 
-      - name: Upload jobs database
-        uses: actions/upload-artifact@v4
-        with:
-          name: workday-jobs-db
-          path: jobs.db
-          retention-days: 90
-          overwrite: true
-
-      # ------------------------------------------------------
-      # Save discovered Workday tenants
-      # ------------------------------------------------------
-
-      - name: Upload Workday tenant cache
-        uses: actions/upload-artifact@v4
-        with:
-          name: workday-tenants
-          path: tenants.json
-          retention-days: 90
-          overwrite: true
-        if: always() && hashFiles('tenants.json') != ''
+          python scanner.py "$TICKER"
