@@ -191,23 +191,82 @@ def load_companies():
 
 def unwrap_search_url(url):
     """
-    Handles DuckDuckGo/Google redirect URLs.
+    Convert search-engine redirect URLs into the actual URL.
+
+    Handles:
+      - DuckDuckGo uddg=
+      - Google /url?q=
+      - Bing /ck/a?...&u=
     """
 
+    if not url:
+        return url
+
     try:
-        parsed = urlparse(url)
+        # Keep unwrapping until the URL stops changing.
+        for _ in range(3):
+            original = url
 
-        query = parse_qs(parsed.query)
+            parsed = urlparse(url)
+            query = parse_qs(parsed.query)
 
-        for key in ("uddg", "q", "url"):
-            if key in query and query[key]:
-                return unquote(query[key][0])
+            # ------------------------------------------------
+            # DuckDuckGo / Google
+            # ------------------------------------------------
+
+            for key in ("uddg", "q", "url"):
+                if key in query and query[key]:
+                    candidate = unquote(query[key][0])
+
+                    if candidate.startswith("http"):
+                        url = candidate
+                        break
+
+            # ------------------------------------------------
+            # Bing
+            #
+            # Bing commonly uses:
+            #
+            # &u=a1<base64 encoded URL>
+            # ------------------------------------------------
+
+            if url == original:
+                if "u" in query and query["u"]:
+
+                    encoded = query["u"][0]
+
+                    # Bing's value often starts with "a1"
+                    if encoded.startswith("a1"):
+                        encoded = encoded[2:]
+
+                    try:
+                        import base64
+
+                        # Restore missing base64 padding.
+                        encoded += "=" * (
+                            (-len(encoded)) % 4
+                        )
+
+                        decoded = base64.urlsafe_b64decode(
+                            encoded
+                        ).decode(
+                            "utf-8",
+                            errors="ignore",
+                        )
+
+                        if decoded.startswith("http"):
+                            url = decoded
+
+                    except Exception:
+                        pass
+
+            if url == original:
+                break
 
         return url
 
     except Exception:
         return url
-
 
 def parse_workday_url(url):
     """
@@ -335,72 +394,85 @@ def validate_workday_site(info):
 
 def extract_workday_urls_from_html(raw_html):
     """
-    Extract any myworkdayjobs.com URLs from arbitrary
-    search-engine HTML.
+    Extract Workday URLs from search-engine HTML.
 
-    This is intentionally not dependent on a search engine's
-    CSS classes because those can change or differ in CI.
+    Handles direct URLs as well as search-engine redirect
+    links such as Bing /ck/a URLs.
     """
 
     if not raw_html:
         return []
 
-    # Find normal URLs embedded in HTML.
-    candidates = re.findall(
-        r'https?://[^"\'>\s<>]+myworkdayjobs\.com[^"\'>\s<>]*',
-        raw_html,
-        flags=re.IGNORECASE,
-    )
+    candidates = []
 
-    results = []
+    # --------------------------------------------------------
+    # Extract hrefs
+    # --------------------------------------------------------
 
-    for url in candidates:
-        url = html.unescape(url)
-
-        # Remove common trailing punctuation.
-        url = url.rstrip(
-            '.,);\'"'
-        )
-
-        url = unwrap_search_url(url)
-
-        if "myworkdayjobs.com" in url.lower():
-            results.append(url)
-
-    # Also inspect href attributes more generally.
     hrefs = re.findall(
         r'href=["\']([^"\']+)["\']',
         raw_html,
         flags=re.IGNORECASE,
     )
 
-    for href in hrefs:
-        href = html.unescape(href)
+    candidates.extend(hrefs)
 
-        if "myworkdayjobs.com" not in href.lower():
-            continue
+    # --------------------------------------------------------
+    # Extract plain URLs as a fallback
+    # --------------------------------------------------------
 
-        href = unwrap_search_url(href)
+    plain_urls = re.findall(
+        r'https?://[^"\'>\s<>]+',
+        raw_html,
+        flags=re.IGNORECASE,
+    )
 
-        if href.startswith("//"):
-            href = "https:" + href
+    candidates.extend(plain_urls)
 
-        if href.startswith("http"):
-            results.append(href)
-
-    # Deduplicate.
-    unique = []
+    results = []
     seen = set()
 
-    for url in results:
-        key = url.lower()
+    for candidate in candidates:
 
-        if key not in seen:
-            seen.add(key)
-            unique.append(url)
+        candidate = html.unescape(
+            candidate
+        )
 
-    return unique
+        candidate = unwrap_search_url(
+            candidate
+        )
 
+        if not candidate.startswith("http"):
+            continue
+
+        if "myworkdayjobs.com" not in candidate.lower():
+            continue
+
+        # Clean trailing punctuation.
+        candidate = candidate.rstrip(
+            '.,);\'">'
+        )
+
+        # Make sure it really parses as a Workday URL.
+        info = parse_workday_url(
+            candidate
+        )
+
+        if not info:
+            continue
+
+        key = (
+            info["host"].lower(),
+            info["site"].lower(),
+        )
+
+        if key in seen:
+            continue
+
+        seen.add(key)
+        results.append(candidate)
+
+    return results
 
 def search_duckduckgo(query):
     try:
@@ -609,7 +681,8 @@ def discover_company(company):
     for url in discovered_urls:
 
         info = parse_workday_url(url)
-
+        print(f"[PARSED] {company}: {url} -> {info}")
+        
         if not info:
             continue
 
