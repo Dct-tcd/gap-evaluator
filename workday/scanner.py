@@ -19,7 +19,7 @@ from bs4 import BeautifulSoup
 # CONFIG
 # ============================================================
 
-COMPANIES_FILE = "companies.json"
+COMPANIES_FILE = "./workday/companies.json"
 TENANTS_FILE = "tenants.json"
 DATABASE_FILE = "jobs.db"
 
