@@ -329,92 +329,320 @@ def validate_workday_site(info):
         return False
 
 
-def discover_company(company):
+# ============================================================
+# ROBUST WORKDAY DISCOVERY
+# ============================================================
+
+def extract_workday_urls_from_html(raw_html):
     """
-    Uses public search results to discover the company's
-    Workday tenant/shard/site.
+    Extract any myworkdayjobs.com URLs from arbitrary
+    search-engine HTML.
+
+    This is intentionally not dependent on a search engine's
+    CSS classes because those can change or differ in CI.
     """
 
-    existing = load_json(TENANTS_FILE, {})
+    if not raw_html:
+        return []
+
+    # Find normal URLs embedded in HTML.
+    candidates = re.findall(
+        r'https?://[^"\'>\s<>]+myworkdayjobs\.com[^"\'>\s<>]*',
+        raw_html,
+        flags=re.IGNORECASE,
+    )
+
+    results = []
+
+    for url in candidates:
+        url = html.unescape(url)
+
+        # Remove common trailing punctuation.
+        url = url.rstrip(
+            '.,);\'"'
+        )
+
+        url = unwrap_search_url(url)
+
+        if "myworkdayjobs.com" in url.lower():
+            results.append(url)
+
+    # Also inspect href attributes more generally.
+    hrefs = re.findall(
+        r'href=["\']([^"\']+)["\']',
+        raw_html,
+        flags=re.IGNORECASE,
+    )
+
+    for href in hrefs:
+        href = html.unescape(href)
+
+        if "myworkdayjobs.com" not in href.lower():
+            continue
+
+        href = unwrap_search_url(href)
+
+        if href.startswith("//"):
+            href = "https:" + href
+
+        if href.startswith("http"):
+            results.append(href)
+
+    # Deduplicate.
+    unique = []
+    seen = set()
+
+    for url in results:
+        key = url.lower()
+
+        if key not in seen:
+            seen.add(key)
+            unique.append(url)
+
+    return unique
+
+
+def search_duckduckgo(query):
+    try:
+        response = session.get(
+            "https://html.duckduckgo.com/html/",
+            params={"q": query},
+            timeout=REQUEST_TIMEOUT,
+            headers={
+                "User-Agent": (
+                    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                    "AppleWebKit/537.36 "
+                    "(KHTML, like Gecko) "
+                    "Chrome/139.0 Safari/537.36"
+                )
+            },
+        )
+
+        if response.status_code != 200:
+            print(
+                f"[DDG] HTTP {response.status_code}"
+            )
+            return []
+
+        return extract_workday_urls_from_html(
+            response.text
+        )
+
+    except requests.RequestException as exc:
+        print(f"[DDG] Request failed: {exc}")
+        return []
+
+
+def search_bing(query):
+    try:
+        response = session.get(
+            "https://www.bing.com/search",
+            params={"q": query},
+            timeout=REQUEST_TIMEOUT,
+            headers={
+                "User-Agent": (
+                    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                    "AppleWebKit/537.36 "
+                    "(KHTML, like Gecko) "
+                    "Chrome/139.0 Safari/537.36"
+                )
+            },
+        )
+
+        if response.status_code != 200:
+            print(
+                f"[BING] HTTP {response.status_code}"
+            )
+            return []
+
+        return extract_workday_urls_from_html(
+            response.text
+        )
+
+    except requests.RequestException as exc:
+        print(f"[BING] Request failed: {exc}")
+        return []
+
+
+def search_google(query):
+    try:
+        response = session.get(
+            "https://www.google.com/search",
+            params={
+                "q": query,
+                "num": 10,
+            },
+            timeout=REQUEST_TIMEOUT,
+            headers={
+                "User-Agent": (
+                    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                    "AppleWebKit/537.36 "
+                    "(KHTML, like Gecko) "
+                    "Chrome/139.0 Safari/537.36"
+                )
+            },
+        )
+
+        if response.status_code != 200:
+            print(
+                f"[GOOGLE] HTTP {response.status_code}"
+            )
+            return []
+
+        return extract_workday_urls_from_html(
+            response.text
+        )
+
+    except requests.RequestException as exc:
+        print(f"[GOOGLE] Request failed: {exc}")
+        return []
+
+
+def discover_company(company):
+    """
+    Discover and validate a Workday tenant/site.
+
+    Uses multiple search engines because GitHub Actions
+    runners can receive different results from search engines
+    than a normal browser.
+    """
+
+    existing = load_json(
+        TENANTS_FILE,
+        {},
+    )
+
+    # --------------------------------------------------------
+    # Try cached tenant first
+    # --------------------------------------------------------
 
     if company in existing:
         info = existing[company]
+
+        print(
+            f"[CACHE CHECK] {company} -> "
+            f"{info.get('host')}/{info.get('site')}"
+        )
 
         if validate_workday_site(info):
             print(f"[CACHE] {company}")
             return company, info
 
+        print(
+            f"[CACHE INVALID] {company}"
+        )
+
+    # --------------------------------------------------------
+    # Search queries
+    # --------------------------------------------------------
+
     queries = [
-        f'"{company}" site:myworkdayjobs.com careers',
-        f'"{company}" site:myworkdayjobs.com jobs',
+        f'"{company}" site:myworkdayjobs.com',
+        f'"{company}" Workday careers',
     ]
+
+    discovered_urls = []
+
+    # --------------------------------------------------------
+    # Search engines
+    # --------------------------------------------------------
+
+    for query in queries:
+
+        print(
+            f"[DISCOVER] {company} | {query}"
+        )
+
+        # DuckDuckGo
+        throttle()
+
+        urls = search_duckduckgo(query)
+
+        if urls:
+            print(
+                f"[DDG] {company}: "
+                f"{len(urls)} Workday URL(s)"
+            )
+
+        discovered_urls.extend(urls)
+
+        # Bing
+        if not urls:
+            throttle()
+
+            urls = search_bing(query)
+
+            if urls:
+                print(
+                    f"[BING] {company}: "
+                    f"{len(urls)} Workday URL(s)"
+                )
+
+            discovered_urls.extend(urls)
+
+        # Google
+        if not urls:
+            throttle()
+
+            urls = search_google(query)
+
+            if urls:
+                print(
+                    f"[GOOGLE] {company}: "
+                    f"{len(urls)} Workday URL(s)"
+                )
+
+            discovered_urls.extend(urls)
+
+        # We have something useful.
+        if discovered_urls:
+            break
+
+    # --------------------------------------------------------
+    # Convert URLs into Workday tenant info
+    # --------------------------------------------------------
 
     discovered = []
 
-    for query in queries:
-        throttle()
-
-        try:
-            response = session.get(
-                "https://html.duckduckgo.com/html/",
-                params={"q": query},
-                timeout=REQUEST_TIMEOUT,
-                headers={
-                    "User-Agent": (
-                        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                        "AppleWebKit/537.36 "
-                        "Chrome/139.0 Safari/537.36"
-                    )
-                },
-            )
-        except requests.RequestException:
-            continue
-
-        if response.status_code != 200:
-            continue
-
-        soup = BeautifulSoup(response.text, "html.parser")
-
-        for anchor in soup.select("a.result__a"):
-            href = anchor.get("href")
-
-            if not href:
-                continue
-
-            href = unwrap_search_url(href)
-
-            if "myworkdayjobs.com" not in href.lower():
-                continue
-
-            info = parse_workday_url(href)
-
-            if info:
-                discovered.append(info)
-
-    # Remove duplicates while preserving order.
-    unique = []
-
     seen = set()
 
-    for info in discovered:
+    for url in discovered_urls:
+
+        info = parse_workday_url(url)
+
+        if not info:
+            continue
+
         key = (
-            info["host"],
-            info["site"],
+            info["host"].lower(),
+            info["site"].lower(),
         )
 
-        if key not in seen:
-            seen.add(key)
-            unique.append(info)
+        if key in seen:
+            continue
 
-    for info in unique:
+        seen.add(key)
+        discovered.append(info)
+
+    # --------------------------------------------------------
+    # Validate candidates
+    # --------------------------------------------------------
+
+    for info in discovered:
+
         print(
             f"[CHECK] {company} -> "
             f"{info['host']}/{info['site']}"
         )
 
         if validate_workday_site(info):
+
             existing[company] = info
-            save_json(TENANTS_FILE, existing)
+
+            save_json(
+                TENANTS_FILE,
+                existing,
+            )
 
             print(
                 f"[FOUND] {company}: "
@@ -423,10 +651,11 @@ def discover_company(company):
 
             return company, info
 
-    print(f"[MISS] {company}")
+    print(
+        f"[MISS] {company}"
+    )
 
     return company, None
-
 
 # ============================================================
 # WORKDAY API
