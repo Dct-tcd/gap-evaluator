@@ -2,37 +2,35 @@ import os
 import sys
 import time
 import math
-import json
+import html
 from datetime import datetime, timezone
 
 import pandas as pd
-
-try:
-    from curl_cffi import requests as curl_requests
-except ImportError:
-    print("❌ curl_cffi is not installed.")
-    print("Add curl_cffi to the GitHub Actions pip install command.")
-    sys.exit(1)
+import requests
+from curl_cffi import requests as curl_requests
 
 
 # ============================================================
-# CONFIG
+# CONFIGURATION
 # ============================================================
 
 NSE_HOME = "https://www.nseindia.com"
-NSE_OPTION_CHAIN_PAGE = f"{NSE_HOME}/option-chain"
+NSE_OPTION_CHAIN_PAGE = "https://www.nseindia.com/option-chain"
 
 NSE_CONTRACT_INFO = (
-    f"{NSE_HOME}/api/option-chain-contract-info"
+    "https://www.nseindia.com/api/option-chain-contract-info"
 )
 
 NSE_OPTION_CHAIN_V3 = (
-    f"{NSE_HOME}/api/option-chain-v3"
+    "https://www.nseindia.com/api/option-chain-v3"
 )
 
-TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
-TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
-GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "")
+TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
+TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "").strip()
+
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "").strip()
+
+GEMINI_MODEL = "gemini-3.8-flash"
 
 INDEX_SYMBOLS = {
     "NIFTY",
@@ -42,284 +40,16 @@ INDEX_SYMBOLS = {
 
 
 # ============================================================
-# NSE SESSION
-# ============================================================
-
-def create_nse_session():
-    """
-    NSE is protected by Akamai and can reject normal Python
-    requests. curl_cffi impersonates a real Chrome TLS fingerprint.
-    """
-
-    session = curl_requests.Session(
-        impersonate="chrome"
-    )
-
-    session.headers.update({
-        "User-Agent": (
-            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-            "AppleWebKit/537.36 (KHTML, like Gecko) "
-            "Chrome/140.0.0.0 Safari/537.36"
-        ),
-        "Accept": (
-            "text/html,application/xhtml+xml,application/xml;"
-            "q=0.9,image/avif,image/webp,*/*;q=0.8"
-        ),
-        "Accept-Language": "en-US,en;q=0.9",
-        "Connection": "keep-alive",
-        "Referer": NSE_OPTION_CHAIN_PAGE,
-    })
-
-    return session
-
-
-def warm_nse_session(session):
-    """
-    Establish NSE cookies before hitting the API.
-    """
-
-    urls = [
-        NSE_OPTION_CHAIN_PAGE,
-        f"{NSE_HOME}/api/allIndices",
-    ]
-
-    for url in urls:
-        try:
-            response = session.get(
-                url,
-                timeout=20,
-            )
-
-            print(
-                f"🌐 NSE warm-up: "
-                f"{response.status_code} {url}"
-            )
-
-            time.sleep(1)
-
-        except Exception as exc:
-            print(
-                f"⚠️ NSE warm-up warning: "
-                f"{type(exc).__name__}: {exc}"
-            )
-
-
-def nse_get(session, url, params=None, retries=3):
-    """
-    GET helper with retry logic.
-    """
-
-    last_error = None
-
-    for attempt in range(1, retries + 1):
-
-        try:
-            response = session.get(
-                url,
-                params=params,
-                timeout=25,
-            )
-
-            if response.status_code == 200:
-                return response.json()
-
-            last_error = (
-                f"HTTP {response.status_code}: "
-                f"{response.text[:300]}"
-            )
-
-            print(
-                f"⚠️ NSE request attempt "
-                f"{attempt}/{retries}: {last_error}"
-            )
-
-        except Exception as exc:
-            last_error = str(exc)
-
-            print(
-                f"⚠️ NSE request attempt "
-                f"{attempt}/{retries} failed: {exc}"
-            )
-
-        if attempt < retries:
-            time.sleep(2 * attempt)
-
-    raise RuntimeError(
-        f"NSE request failed after {retries} attempts: "
-        f"{last_error}"
-    )
-
-
-# ============================================================
-# EXPIRY
-# ============================================================
-
-def get_nearest_expiry(session, symbol):
-    """
-    NSE v3 flow:
-        option-chain-contract-info
-            ↓
-        expiryDates[0]
-    """
-
-    print(f"📅 Fetching expiry information for {symbol}...")
-
-    data = nse_get(
-        session,
-        NSE_CONTRACT_INFO,
-        params={
-            "symbol": symbol
-        },
-    )
-
-    expiry_dates = data.get("expiryDates", [])
-
-    if not expiry_dates:
-
-        # Some NSE responses can expose the information
-        # in slightly different locations.
-        records = data.get("records", {})
-
-        expiry_dates = records.get(
-            "expiryDates",
-            []
-        )
-
-    if not expiry_dates:
-        raise RuntimeError(
-            f"No expiry dates returned by NSE for {symbol}."
-        )
-
-    # Parse and sort defensively.
-    parsed = []
-
-    for expiry in expiry_dates:
-
-        try:
-            dt = datetime.strptime(
-                expiry,
-                "%d-%b-%Y"
-            )
-
-            parsed.append(
-                (dt, expiry)
-            )
-
-        except ValueError:
-            continue
-
-    if not parsed:
-        raise RuntimeError(
-            f"Could not parse NSE expiry dates: "
-            f"{expiry_dates}"
-        )
-
-    parsed.sort(key=lambda x: x[0])
-
-    nearest_expiry = parsed[0][1]
-
-    print(
-        f"✅ Nearest expiry for {symbol}: "
-        f"{nearest_expiry}"
-    )
-
-    return nearest_expiry
-
-
-# ============================================================
-# OPTION CHAIN FETCH
-# ============================================================
-
-def fetch_nse_option_chain(symbol, mode):
-    """
-    Fetch current NSE option chain.
-
-    mode:
-        "indices"  -> type=Indices
-        "equities" -> type=Equity
-    """
-
-    symbol = symbol.upper().strip()
-
-    nse_type = (
-        "Indices"
-        if mode == "indices"
-        else "Equity"
-    )
-
-    print(
-        f"🔎 Fetching NSE option chain: "
-        f"{symbol} ({nse_type})"
-    )
-
-    session = create_nse_session()
-
-    warm_nse_session(session)
-
-    expiry = get_nearest_expiry(
-        session,
-        symbol
-    )
-
-    print(
-        f"📡 Fetching v3 option chain "
-        f"for {symbol} / {expiry}..."
-    )
-
-    data = nse_get(
-        session,
-        NSE_OPTION_CHAIN_V3,
-        params={
-            "type": nse_type,
-            "symbol": symbol,
-            "expiry": expiry,
-        },
-    )
-
-    if not isinstance(data, dict):
-        raise RuntimeError(
-            "NSE returned an unexpected response."
-        )
-
-    records = data.get("records", {})
-
-    rows = records.get("data", [])
-
-    if not rows:
-        # v3 responses should normally expose records.data.
-        # Keep a fallback for alternate response structures.
-        filtered = data.get("filtered", {})
-        rows = filtered.get("data", [])
-
-    if not rows:
-        raise RuntimeError(
-            f"NSE returned no option-chain rows "
-            f"for {symbol}."
-        )
-
-    print(
-        f"✅ Received {len(rows)} NSE option-chain rows."
-    )
-
-    return data, expiry
-
-
-# ============================================================
-# NUMERIC HELPERS
+# GENERIC HELPERS
 # ============================================================
 
 def safe_float(value, default=0.0):
-
     try:
-
         if value is None:
             return default
 
         if isinstance(value, str):
             value = value.replace(",", "").strip()
-
-            if value == "":
-                return default
 
         result = float(value)
 
@@ -333,33 +63,366 @@ def safe_float(value, default=0.0):
 
 
 def safe_int(value, default=0):
-    return int(safe_float(value, default))
+    try:
+        if value is None:
+            return default
+
+        if isinstance(value, str):
+            value = value.replace(",", "").strip()
+
+        return int(float(value))
+
+    except (ValueError, TypeError):
+        return default
+
+
+def clean_ticker(value):
+    if not value:
+        return ""
+
+    return (
+        str(value)
+        .strip()
+        .upper()
+        .replace(" ", "")
+    )
+
+
+def format_number(value):
+    try:
+        return f"{float(value):,.2f}"
+    except Exception:
+        return str(value)
+
+
+def format_integer(value):
+    try:
+        return f"{int(value):,}"
+    except Exception:
+        return str(value)
 
 
 # ============================================================
-# BUILD NORMALIZED DATAFRAME
+# NSE SESSION
+# ============================================================
+
+def create_nse_session():
+    """
+    NSE is much more reliable when accessed through a browser-like
+    session with cookies and realistic headers.
+    """
+
+    session = curl_requests.Session(
+        impersonate="chrome"
+    )
+
+    session.headers.update({
+        "User-Agent": (
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) "
+            "Chrome/140.0.0.0 Safari/537.36"
+        ),
+        "Accept": (
+            "text/html,application/xhtml+xml,"
+            "application/xml;q=0.9,image/avif,image/webp,"
+            "image/apng,*/*;q=0.8"
+        ),
+        "Accept-Language": "en-US,en;q=0.9",
+        "Accept-Encoding": "gzip, deflate, br",
+        "Connection": "keep-alive",
+        "Upgrade-Insecure-Requests": "1",
+    })
+
+    return session
+
+
+def warm_nse_session(session):
+    """
+    Establish NSE cookies before hitting API endpoints.
+    """
+
+    print("Warming NSE session...")
+
+    try:
+        response = session.get(
+            NSE_HOME,
+            timeout=20,
+            allow_redirects=True,
+        )
+
+        print(
+            f"NSE home: {response.status_code} "
+            f"{response.url}"
+        )
+
+    except Exception as exc:
+        print(f"NSE home warm-up warning: {exc}")
+
+    try:
+        response = session.get(
+            NSE_OPTION_CHAIN_PAGE,
+            timeout=20,
+            allow_redirects=True,
+        )
+
+        print(
+            f"NSE option-chain page: "
+            f"{response.status_code}"
+        )
+
+    except Exception as exc:
+        print(
+            f"NSE option-chain warm-up warning: "
+            f"{exc}"
+        )
+
+    time.sleep(0.8)
+
+
+def nse_get(session, url, params=None):
+    """
+    GET request against NSE with browser-like headers.
+    """
+
+    headers = {
+        "Accept": "application/json,text/plain,*/*",
+        "Referer": NSE_OPTION_CHAIN_PAGE,
+        "Sec-Fetch-Dest": "empty",
+        "Sec-Fetch-Mode": "cors",
+        "Sec-Fetch-Site": "same-origin",
+    }
+
+    response = session.get(
+        url,
+        params=params,
+        headers=headers,
+        timeout=30,
+    )
+
+    print(
+        f"NSE API: {response.status_code} "
+        f"{response.url}"
+    )
+
+    response.raise_for_status()
+
+    try:
+        return response.json()
+
+    except Exception as exc:
+        print("NSE returned non-JSON response.")
+        print(response.text[:1000])
+        raise RuntimeError(
+            f"Unable to decode NSE JSON: {exc}"
+        )
+
+
+# ============================================================
+# NSE EXPIRY
+# ============================================================
+
+def extract_expiry_dates(raw):
+    """
+    NSE has changed the nesting of expiry information across
+    endpoint versions. Search several known structures.
+    """
+
+    candidates = []
+
+    def collect(obj):
+        if isinstance(obj, dict):
+
+            for key in (
+                "expiryDates",
+                "expiryDate",
+                "expiries",
+            ):
+                value = obj.get(key)
+
+                if isinstance(value, list):
+                    candidates.extend(value)
+
+                elif isinstance(value, str):
+                    candidates.append(value)
+
+            for value in obj.values():
+                if isinstance(value, (dict, list)):
+                    collect(value)
+
+        elif isinstance(obj, list):
+            for item in obj:
+                collect(item)
+
+    collect(raw)
+
+    cleaned = []
+
+    for item in candidates:
+
+        if not isinstance(item, str):
+            continue
+
+        item = item.strip()
+
+        if item and item not in cleaned:
+            cleaned.append(item)
+
+    return cleaned
+
+
+def get_nearest_expiry(session, symbol, mode):
+    """
+    Fetch available expiries from NSE contract-info endpoint.
+    """
+
+    print(
+        f"Fetching expiry information for "
+        f"{symbol}..."
+    )
+
+    params = {
+        "symbol": symbol,
+        "type": mode,
+    }
+
+    raw = nse_get(
+        session,
+        NSE_CONTRACT_INFO,
+        params=params,
+    )
+
+    expiry_dates = extract_expiry_dates(raw)
+
+    if not expiry_dates:
+
+        # Fallback to older records-style response.
+        records = raw.get("records", {})
+
+        expiry_dates = records.get(
+            "expiryDates",
+            []
+        )
+
+    if not expiry_dates:
+        raise RuntimeError(
+            "NSE did not return any expiry dates."
+        )
+
+    expiry = expiry_dates[0]
+
+    print(
+        f"Nearest expiry for {symbol}: "
+        f"{expiry}"
+    )
+
+    return expiry
+
+
+# ============================================================
+# NSE OPTION CHAIN
+# ============================================================
+
+def fetch_nse_option_chain(symbol, mode):
+    """
+    Fetch current NSE option-chain-v3 data.
+    """
+
+    session = create_nse_session()
+
+    warm_nse_session(session)
+
+    expiry = get_nearest_expiry(
+        session,
+        symbol,
+        mode,
+    )
+
+    print(
+        f"Fetching v3 option chain for "
+        f"{symbol} / {expiry}..."
+    )
+
+    params = {
+        "type": mode,
+        "symbol": symbol,
+        "expiry": expiry,
+    }
+
+    raw = nse_get(
+        session,
+        NSE_OPTION_CHAIN_V3,
+        params=params,
+    )
+
+    # Count rows for diagnostics.
+    rows = []
+
+    if isinstance(raw.get("filtered"), dict):
+        rows = raw["filtered"].get("data", [])
+
+    if not rows and isinstance(raw.get("records"), dict):
+        rows = raw["records"].get("data", [])
+
+    print(
+        f"Received {len(rows)} NSE "
+        f"option-chain rows."
+    )
+
+    if not rows:
+        raise RuntimeError(
+            "NSE returned no option-chain rows."
+        )
+
+    return raw, expiry
+
+
+# ============================================================
+# OPTION CHAIN PARSER
 # ============================================================
 
 def build_option_dataframe(raw_data, expiry):
     """
-    Convert NSE records.data into a clean dataframe.
+    Convert NSE option-chain-v3 JSON into a normalized dataframe.
 
-    Each row represents one strike.
+    Supports both:
+
+        filtered.data
+
+    and:
+
+        records.data
+
+    NSE's v3 endpoint already receives the requested expiry,
+    so we intentionally do NOT reject rows merely because
+    expiry fields inside CE/PE are missing.
     """
 
+    filtered = raw_data.get("filtered", {})
     records = raw_data.get("records", {})
-    rows = records.get("data", [])
+
+    rows = []
+
+    if isinstance(filtered, dict):
+        rows = filtered.get("data", [])
+
+    if not rows and isinstance(records, dict):
+        rows = records.get("data", [])
 
     if not rows:
-        rows = (
-            raw_data
-            .get("filtered", {})
-            .get("data", [])
+        raise RuntimeError(
+            "NSE returned no option-chain data rows."
         )
+
+    print(
+        f"Parsing {len(rows)} option-chain rows..."
+    )
 
     normalized = []
 
     for item in rows:
+
+        if not isinstance(item, dict):
+            continue
 
         strike = safe_float(
             item.get("strikePrice")
@@ -368,72 +431,126 @@ def build_option_dataframe(raw_data, expiry):
         if strike <= 0:
             continue
 
-        ce = item.get("CE") or {}
-        pe = item.get("PE") or {}
+        ce = item.get("CE")
 
-        # Some responses can contain multiple expiries.
-        # Keep the requested expiry when available.
-        ce_expiry = ce.get("expiryDate")
-        pe_expiry = pe.get("expiryDate")
+        if not isinstance(ce, dict):
+            ce = {}
 
-        if ce_expiry and ce_expiry != expiry:
-            continue
+        pe = item.get("PE")
 
-        if pe_expiry and pe_expiry != expiry:
-            continue
+        if not isinstance(pe, dict):
+            pe = {}
 
         normalized.append({
             "Strike": strike,
 
             "CE_Volume": safe_int(
-                ce.get("totalTradedVolume")
-                if "totalTradedVolume" in ce
-                else ce.get("volume")
+                ce.get("totalTradedVolume", 0)
             ),
 
             "PE_Volume": safe_int(
-                pe.get("totalTradedVolume")
-                if "totalTradedVolume" in pe
-                else pe.get("volume")
+                pe.get("totalTradedVolume", 0)
             ),
 
             "CE_OI": safe_int(
-                ce.get("openInterest")
+                ce.get("openInterest", 0)
             ),
 
             "PE_OI": safe_int(
-                pe.get("openInterest")
+                pe.get("openInterest", 0)
             ),
 
             "CE_LTP": safe_float(
-                ce.get("lastPrice")
+                ce.get("lastPrice", 0)
             ),
 
             "PE_LTP": safe_float(
-                pe.get("lastPrice")
+                pe.get("lastPrice", 0)
             ),
 
             "CE_Change_OI": safe_int(
-                ce.get("changeinOpenInterest")
+                ce.get("changeinOpenInterest", 0)
             ),
 
             "PE_Change_OI": safe_int(
-                pe.get("changeinOpenInterest")
+                pe.get("changeinOpenInterest", 0)
+            ),
+
+            "CE_IV": safe_float(
+                ce.get("impliedVolatility", 0)
+            ),
+
+            "PE_IV": safe_float(
+                pe.get("impliedVolatility", 0)
             ),
         })
 
-    df = pd.DataFrame(normalized)
+    if not normalized:
 
-    if df.empty:
-        raise RuntimeError(
-            "Could not construct option-chain dataframe."
+        # Very useful diagnostic if NSE changes the schema again.
+        first_row = rows[0]
+
+        print(
+            "First NSE row keys:",
+            list(first_row.keys())
         )
+
+        print(
+            "First NSE row sample:",
+            str(first_row)[:2500]
+        )
+
+        raise RuntimeError(
+            "NSE returned option-chain rows, "
+            "but none contained a valid strikePrice."
+        )
+
+    df = pd.DataFrame(normalized)
 
     df = (
         df
-        .drop_duplicates(subset=["Strike"])
+        .drop_duplicates(
+            subset=["Strike"]
+        )
         .sort_values("Strike")
         .reset_index(drop=True)
+    )
+
+    if df.empty:
+        raise RuntimeError(
+            "Option dataframe is empty after parsing."
+        )
+
+    print(
+        f"Successfully parsed "
+        f"{len(df)} strikes."
+    )
+
+    print(
+        f"Strike range: "
+        f"{df['Strike'].min()} "
+        f"→ "
+        f"{df['Strike'].max()}"
+    )
+
+    print(
+        f"CE OI: "
+        f"{int(df['CE_OI'].sum()):,}"
+    )
+
+    print(
+        f"PE OI: "
+        f"{int(df['PE_OI'].sum()):,}"
+    )
+
+    print(
+        f"CE Volume: "
+        f"{int(df['CE_Volume'].sum()):,}"
+    )
+
+    print(
+        f"PE Volume: "
+        f"{int(df['PE_Volume'].sum()):,}"
     )
 
     return df
@@ -445,210 +562,211 @@ def build_option_dataframe(raw_data, expiry):
 
 def get_spot_price(raw_data, df):
     """
-    Prefer NSE's underlyingValue from CE/PE.
-    Fall back to the nearest non-zero underlying value.
+    Extract underlying spot price from NSE response.
     """
 
     records = raw_data.get("records", {})
 
-    possible_values = [
-        records.get("underlyingValue"),
-        records.get("underlyingValue"),
-    ]
+    if isinstance(records, dict):
 
-    for value in possible_values:
-
-        value = safe_float(value)
+        value = safe_float(
+            records.get(
+                "underlyingValue",
+                0
+            )
+        )
 
         if value > 0:
             return value
 
-    rows = records.get("data", [])
+    filtered = raw_data.get("filtered", {})
 
-    for item in rows:
+    if isinstance(filtered, dict):
 
-        ce = item.get("CE") or {}
-        pe = item.get("PE") or {}
+        for item in filtered.get("data", []):
 
-        for side in (ce, pe):
+            if not isinstance(item, dict):
+                continue
 
-            value = safe_float(
-                side.get("underlyingValue")
-            )
+            ce = item.get("CE") or {}
+            pe = item.get("PE") or {}
 
-            if value > 0:
-                return value
+            for side in (ce, pe):
 
-    # Last-resort estimate from the strike grid.
-    # This should rarely be reached.
+                value = safe_float(
+                    side.get(
+                        "underlyingValue",
+                        0
+                    )
+                )
+
+                if value > 0:
+                    return value
+
+    if isinstance(records, dict):
+
+        for item in records.get("data", []):
+
+            if not isinstance(item, dict):
+                continue
+
+            ce = item.get("CE") or {}
+            pe = item.get("PE") or {}
+
+            for side in (ce, pe):
+
+                value = safe_float(
+                    side.get(
+                        "underlyingValue",
+                        0
+                    )
+                )
+
+                if value > 0:
+                    return value
+
+    # Last-resort fallback.
     if not df.empty:
-        return float(df["Strike"].median())
+        return float(
+            df["Strike"].median()
+        )
 
     return 0.0
+
+
+# ============================================================
+# STRIKE STEP
+# ============================================================
+
+def calculate_strike_step(df):
+    strikes = sorted(
+        set(
+            safe_float(x)
+            for x in df["Strike"].tolist()
+        )
+    )
+
+    differences = []
+
+    for i in range(1, len(strikes)):
+
+        diff = strikes[i] - strikes[i - 1]
+
+        if diff > 0:
+            differences.append(diff)
+
+    if not differences:
+        return 1.0
+
+    # Most common / smallest sensible increment.
+    differences.sort()
+
+    return float(
+        differences[len(differences) // 2]
+    )
 
 
 # ============================================================
 # SINGULARITY MATRIX
 # ============================================================
 
-def process_singularity_matrix(
-    symbol,
-    mode,
-):
+def process_singularity_matrix(symbol, mode):
     """
-    Core scanner logic.
+    Main quantitative option-chain engine.
+    """
 
-    Finds:
-      - nearest expiry
-      - spot
-      - ATM
-      - ATM +/- 5 strike zone
-      - CE volume resistance
-      - CE OI resistance
-      - PE volume support
-      - PE OI support
-      - PCR volume
-      - PCR OI
-      - EOR
-      - EOS
-    """
+    print("")
+    print("=" * 70)
+    print(f"SCANNING {symbol}")
+    print("=" * 70)
 
     raw_data, expiry = fetch_nse_option_chain(
         symbol,
-        mode
+        mode,
     )
 
     df = build_option_dataframe(
         raw_data,
-        expiry
+        expiry,
     )
 
     spot = get_spot_price(
         raw_data,
-        df
+        df,
     )
 
     if spot <= 0:
         raise RuntimeError(
-            "Unable to determine underlying spot price."
+            "Could not determine underlying spot price."
         )
 
-    # --------------------------------------------------------
-    # Strike step
-    # --------------------------------------------------------
-
-    strikes = sorted(
-        float(x)
-        for x in df["Strike"].unique()
+    strike_step = calculate_strike_step(
+        df
     )
 
-    differences = [
-        strikes[i + 1] - strikes[i]
-        for i in range(len(strikes) - 1)
-        if strikes[i + 1] > strikes[i]
-    ]
-
-    step = (
-        min(differences)
-        if differences
-        else 0
+    # Nearest ATM strike.
+    atm_row = (
+        df.iloc[
+            (
+                df["Strike"] - spot
+            ).abs().argsort()[:1]
+        ]
     )
-
-    # --------------------------------------------------------
-    # ATM
-    # --------------------------------------------------------
-
-    atm_index = (
-        df["Strike"] - spot
-    ).abs().idxmin()
 
     atm = float(
-        df.loc[atm_index, "Strike"]
+        atm_row.iloc[0]["Strike"]
     )
 
-    # --------------------------------------------------------
-    # ATM zone: 5 strikes above + 5 below
-    # --------------------------------------------------------
-
-    atm_position = (
-        df.index[
-            df["Strike"] == atm
-        ][0]
+    # 5 strikes above and below ATM.
+    zone_low = atm - (
+        strike_step * 5
     )
 
-    start = max(
-        0,
-        atm_position - 5
+    zone_high = atm + (
+        strike_step * 5
     )
 
-    end = min(
-        len(df),
-        atm_position + 6
-    )
-
-    zone = df.iloc[
-        start:end
+    zone = df[
+        (df["Strike"] >= zone_low)
+        &
+        (df["Strike"] <= zone_high)
     ].copy()
 
     if zone.empty:
-        raise RuntimeError(
-            "ATM analysis zone is empty."
-        )
+        zone = df.copy()
 
     # --------------------------------------------------------
-    # Resistance
+    # RESISTANCE
     # --------------------------------------------------------
 
-    ce_volume_row = zone.loc[
-        zone["CE_Volume"].idxmax()
-    ]
-
-    ce_oi_row = zone.loc[
+    resistance_by_oi = zone.loc[
         zone["CE_OI"].idxmax()
     ]
 
-    resistance_volume = float(
-        ce_volume_row["Strike"]
-    )
-
-    resistance_oi = float(
-        ce_oi_row["Strike"]
-    )
-
-    # Primary resistance follows the strongest CE OI
-    # with volume used as confirmation.
-    resistance = resistance_oi
-
-    resistance_ce_ltp = safe_float(
-        ce_oi_row["CE_LTP"]
-    )
-
-    # --------------------------------------------------------
-    # Support
-    # --------------------------------------------------------
-
-    pe_volume_row = zone.loc[
-        zone["PE_Volume"].idxmax()
+    resistance_by_volume = zone.loc[
+        zone["CE_Volume"].idxmax()
     ]
 
-    pe_oi_row = zone.loc[
+    # Primary resistance = strongest CE OI.
+    resistance = float(
+        resistance_by_oi["Strike"]
+    )
+
+    # --------------------------------------------------------
+    # SUPPORT
+    # --------------------------------------------------------
+
+    support_by_oi = zone.loc[
         zone["PE_OI"].idxmax()
     ]
 
-    support_volume = float(
-        pe_volume_row["Strike"]
-    )
+    support_by_volume = zone.loc[
+        zone["PE_Volume"].idxmax()
+    ]
 
-    support_oi = float(
-        pe_oi_row["Strike"]
-    )
-
-    # Primary support follows the strongest PE OI
-    # with volume used as confirmation.
-    support = support_oi
-
-    support_pe_ltp = safe_float(
-        pe_oi_row["PE_LTP"]
+    # Primary support = strongest PE OI.
+    support = float(
+        support_by_oi["Strike"]
     )
 
     # --------------------------------------------------------
@@ -674,414 +792,404 @@ def process_singularity_matrix(
     pcr_volume = (
         total_pe_volume / total_ce_volume
         if total_ce_volume > 0
-        else 0
+        else 0.0
     )
 
     pcr_oi = (
         total_pe_oi / total_ce_oi
         if total_ce_oi > 0
-        else 0
+        else 0.0
     )
 
     # --------------------------------------------------------
     # EOR / EOS
     # --------------------------------------------------------
 
+    resistance_ce_ltp = safe_float(
+        resistance_by_oi["CE_LTP"]
+    )
+
+    support_pe_ltp = safe_float(
+        support_by_oi["PE_LTP"]
+    )
+
     eor = resistance + resistance_ce_ltp
 
     eos = support - support_pe_ltp
 
     # --------------------------------------------------------
-    # Strength / confirmation
+    # STRENGTH
     # --------------------------------------------------------
 
-    max_ce_volume = float(
-        zone["CE_Volume"].max()
+    resistance_oi = safe_float(
+        resistance_by_oi["CE_OI"]
     )
 
-    max_pe_volume = float(
-        zone["PE_Volume"].max()
+    support_oi = safe_float(
+        support_by_oi["PE_OI"]
     )
 
-    max_ce_oi = float(
-        zone["CE_OI"].max()
+    resistance_volume = safe_int(
+        resistance_by_volume["CE_Volume"]
     )
 
-    max_pe_oi = float(
-        zone["PE_OI"].max()
+    support_volume = safe_int(
+        support_by_volume["PE_Volume"]
     )
 
-    resistance_status = (
-        "STRONG"
-        if max_ce_oi > 0 and max_ce_volume > 0
-        else "WEAK"
-    )
-
-    support_status = (
-        "STRONG"
-        if max_pe_oi > 0 and max_pe_volume > 0
-        else "WEAK"
-    )
-
-    # Volume confirmation.
-    if (
-        pcr_volume > 1
-        and total_pe_volume > total_ce_volume
-    ):
-        eor_type = "CE RESISTANCE"
-        eor_status = "PRESSURE ABOVE"
+    if pcr_volume > 1.0:
+        eor_status = "VOL BREAKOUT SUPPORTED"
     else:
-        eor_type = "CE RESISTANCE"
-        eor_status = "POTENTIAL BREAKOUT ZONE"
+        eor_status = "LIQUIDITY RESISTANCE BLOCKED"
 
-    if (
-        pcr_volume > 1
-        and total_pe_volume > total_ce_volume
-    ):
-        eos_type = "PE SUPPORT"
-        eos_status = "BUYING SUPPORT"
+    if pcr_oi > 1.0:
+        eos_status = "PUT OI SUPPORTIVE"
     else:
-        eos_type = "PE SUPPORT"
-        eos_status = "SUPPORT UNDER TEST"
+        eos_status = "CALL OI DOMINANT"
 
-    # --------------------------------------------------------
-    # Return metrics
-    # --------------------------------------------------------
+    resistance_strength = (
+        "STRONG"
+        if resistance_oi >= support_oi
+        else "MODERATE"
+    )
 
-    return {
+    support_strength = (
+        "STRONG"
+        if support_oi >= resistance_oi
+        else "MODERATE"
+    )
+
+    metrics = {
         "Asset": symbol,
-        "Spot": round(spot, 2),
+        "Spot": spot,
         "Expiry": expiry,
+        "ATM": atm,
+        "Strike_Step": strike_step,
 
-        "ATM": round(atm, 2),
-        "Strike_Step": round(step, 2),
+        "Zone_Low": zone_low,
+        "Zone_High": zone_high,
 
-        "Zone_Low": round(
-            float(zone["Strike"].min()),
-            2
+        "Resistance": resistance,
+        "Resistance_By_Volume": float(
+            resistance_by_volume["Strike"]
+        ),
+        "Resistance_By_OI": float(
+            resistance_by_oi["Strike"]
         ),
 
-        "Zone_High": round(
-            float(zone["Strike"].max()),
-            2
+        "Support": support,
+        "Support_By_Volume": float(
+            support_by_volume["Strike"]
+        ),
+        "Support_By_OI": float(
+            support_by_oi["Strike"]
         ),
 
-        "Resistance": round(
-            resistance,
-            2
-        ),
+        "CE_Max_Volume": resistance_volume,
+        "CE_Max_OI": resistance_oi,
 
-        "Resistance_By_Volume": round(
-            resistance_volume,
-            2
-        ),
+        "PE_Max_Volume": support_volume,
+        "PE_Max_OI": support_oi,
 
-        "Resistance_By_OI": round(
-            resistance_oi,
-            2
-        ),
+        "PCR_Vol": pcr_volume,
+        "PCR_OI": pcr_oi,
 
-        "Support": round(
-            support,
-            2
-        ),
-
-        "Support_By_Volume": round(
-            support_volume,
-            2
-        ),
-
-        "Support_By_OI": round(
-            support_oi,
-            2
-        ),
-
-        "CE_Max_Volume": int(
-            max_ce_volume
-        ),
-
-        "PE_Max_Volume": int(
-            max_pe_volume
-        ),
-
-        "CE_Max_OI": int(
-            max_ce_oi
-        ),
-
-        "PE_Max_OI": int(
-            max_pe_oi
-        ),
-
-        "PCR_Vol": round(
-            pcr_volume,
-            3
-        ),
-
-        "PCR_OI": round(
-            pcr_oi,
-            3
-        ),
-
-        "EOR": round(
-            eor,
-            2
-        ),
-
-        "EOR_Type": eor_type,
+        "EOR": eor,
+        "EOR_Type": "CE OI + CE LTP",
         "EOR_Status": eor_status,
 
-        "EOS": round(
-            eos,
-            2
-        ),
-
-        "EOS_Type": eos_type,
+        "EOS": eos,
+        "EOS_Type": "PE OI - PE LTP",
         "EOS_Status": eos_status,
 
-        "Resistance_Strength":
-            resistance_status,
+        "Resistance_Strength": resistance_strength,
+        "Support_Strength": support_strength,
 
-        "Support_Strength":
-            support_status,
+        "Timestamp": datetime.now(
+            timezone.utc
+        ).isoformat(),
     }
+
+    # --------------------------------------------------------
+    # PRINT MATRIX
+    # --------------------------------------------------------
+
+    print("")
+    print("=" * 70)
+    print("MATRIX RESULT")
+    print("=" * 70)
+
+    print(
+        f"Asset              : {symbol}"
+    )
+
+    print(
+        f"Spot               : "
+        f"{format_number(spot)}"
+    )
+
+    print(
+        f"Expiry             : {expiry}"
+    )
+
+    print(
+        f"ATM                : "
+        f"{format_number(atm)}"
+    )
+
+    print(
+        f"Strike Step        : "
+        f"{format_number(strike_step)}"
+    )
+
+    print(
+        f"Resistance         : "
+        f"{format_number(resistance)}"
+    )
+
+    print(
+        f"Support            : "
+        f"{format_number(support)}"
+    )
+
+    print(
+        f"PCR Volume         : "
+        f"{pcr_volume:.3f}"
+    )
+
+    print(
+        f"PCR OI             : "
+        f"{pcr_oi:.3f}"
+    )
+
+    print(
+        f"EOR                : "
+        f"{format_number(eor)}"
+    )
+
+    print(
+        f"EOS                : "
+        f"{format_number(eos)}"
+    )
+
+    print(
+        f"EOR Status         : "
+        f"{eor_status}"
+    )
+
+    print(
+        f"EOS Status         : "
+        f"{eos_status}"
+    )
+
+    print("=" * 70)
+
+    return metrics
 
 
 # ============================================================
 # GEMINI ANALYSIS
 # ============================================================
 
+def build_gemini_prompt(metrics):
+    """
+    Prompt Gemini to combine the quantitative scanner output
+    with current web information.
+
+    The model is explicitly asked to separate facts from
+    interpretation and avoid inventing news.
+    """
+
+    return f"""
+You are the research and analysis layer of an Indian market
+option-chain scanner.
+
+Analyze the following quantitative NSE option-chain output
+for {metrics['Asset']}.
+
+IMPORTANT:
+- This is research/analysis, not personalized financial advice.
+- Do not invent news or company developments.
+- Use current Google Search results for recent information.
+- Prefer primary sources, company filings, official government/
+  regulator sources, major financial publications, and established
+  news organizations.
+- Clearly distinguish confirmed facts from interpretation.
+- Consider the latest relevant geopolitical developments,
+  government/regulatory actions, macroeconomic conditions,
+  company policies, business developments, sector developments,
+  commodity/energy exposure, currency effects, trade restrictions,
+  sanctions, wars/conflicts, and supply-chain implications where
+  relevant to this asset.
+- Only discuss geopolitical factors that actually have a plausible
+  connection to this asset.
+- Do not treat a single news headline as proof of a market outcome.
+- Do not fabricate a target price.
+- Explain uncertainty.
+
+QUANTITATIVE SCANNER DATA
+-------------------------
+Asset: {metrics['Asset']}
+Spot: {metrics['Spot']}
+Expiry: {metrics['Expiry']}
+ATM: {metrics['ATM']}
+Strike Step: {metrics['Strike_Step']}
+
+Zone:
+Low: {metrics['Zone_Low']}
+High: {metrics['Zone_High']}
+
+Resistance:
+Primary: {metrics['Resistance']}
+Volume-based: {metrics['Resistance_By_Volume']}
+OI-based: {metrics['Resistance_By_OI']}
+CE Max Volume: {metrics['CE_Max_Volume']}
+CE Max OI: {metrics['CE_Max_OI']}
+Strength: {metrics['Resistance_Strength']}
+
+Support:
+Primary: {metrics['Support']}
+Volume-based: {metrics['Support_By_Volume']}
+OI-based: {metrics['Support_By_OI']}
+PE Max Volume: {metrics['PE_Max_Volume']}
+PE Max OI: {metrics['PE_Max_OI']}
+Strength: {metrics['Support_Strength']}
+
+PCR Volume: {metrics['PCR_Vol']}
+PCR OI: {metrics['PCR_OI']}
+
+EOR: {metrics['EOR']}
+EOR Type: {metrics['EOR_Type']}
+EOR Status: {metrics['EOR_Status']}
+
+EOS: {metrics['EOS']}
+EOS Type: {metrics['EOS_Type']}
+EOS Status: {metrics['EOS_Status']}
+
+TASK
+----
+
+Produce a concise research report with exactly these sections:
+
+1. OPTION-CHAIN READ
+Explain what the OI, volume, PCR, support, resistance, EOR
+and EOS are indicating.
+
+2. CURRENT COMPANY / BUSINESS DEVELOPMENTS
+Find relevant recent developments affecting the company or
+underlying asset.
+
+3. MACRO + GEOPOLITICAL CONTEXT
+Find only relevant current geopolitical, regulatory,
+macroeconomic, trade, commodity, currency or supply-chain
+developments.
+
+4. BULLISH FACTORS
+List the strongest factors supporting upside.
+
+5. BEARISH FACTORS
+List the strongest factors creating downside/risk.
+
+6. KEY LEVELS
+State the scanner's support, resistance, EOR and EOS levels
+and explain their meaning. Do not invent additional levels.
+
+7. SYNTHESIS
+Give a balanced interpretation of how the quantitative data
+and current information interact.
+
+8. WHAT WOULD INVALIDATE THIS VIEW
+List concrete events or market conditions that would make
+the current interpretation less useful.
+
+Keep the response Telegram-friendly and reasonably concise.
+Use INR/Indian-market terminology where appropriate.
+"""
+
+
 def get_gemini_analysis(metrics):
     """
-    Gemini combines quantitative option-chain information
-    with current web-grounded information.
+    Use Gemini + Google Search grounding for current information.
     """
 
     if not GEMINI_API_KEY:
-        return (
-            "⚠️ Gemini analysis skipped: "
-            "GEMINI_API_KEY is missing."
+        print(
+            "GEMINI_API_KEY is not configured. "
+            "Skipping Gemini analysis."
         )
+        return ""
 
     try:
         from google import genai
+        from google.genai import types
 
     except ImportError:
-        return (
-            "⚠️ Gemini analysis unavailable: "
-            "google-genai is not installed."
+        print(
+            "google-genai is not installed. "
+            "Skipping Gemini analysis."
         )
+        return ""
 
-    print("🤖 Sending scanner data to Gemini...")
-
-    client = genai.Client(
-        api_key=GEMINI_API_KEY
-    )
-
-    asset = metrics["Asset"]
-
-    prompt = f"""
-You are an Indian equity derivatives market-analysis assistant.
-
-Analyze {asset} using BOTH:
-
-1. The quantitative NSE option-chain data supplied below.
-2. Current web information found using Google Search.
-
-Do NOT invent news, company developments, regulatory events,
-geopolitical events, prices, or market facts.
-
-CURRENT NSE OPTION-CHAIN DATA
------------------------------
-
-{json.dumps(metrics, indent=2)}
-
-ANALYSIS REQUIREMENTS
----------------------
-
-A. OPTIONS STRUCTURE
-- Explain the current ATM and surrounding strike zone.
-- Interpret CE/PE OI.
-- Interpret CE/PE volume.
-- Interpret PCR by volume and OI.
-- Explain the strongest apparent support and resistance.
-- Explain EOR and EOS.
-- Identify whether volume confirms or contradicts OI.
-
-B. COMPANY / INDEX CONTEXT
-For an individual company:
-- Search for recent material company developments.
-- Results, management commentary, major projects,
-  acquisitions, partnerships, product/business developments,
-  regulatory developments and sector-specific events.
-
-For an index:
-- Search for current macroeconomic and market factors
-  relevant to that index.
-
-C. CURRENT NEWS
-Search for genuinely recent developments that could materially
-affect the asset.
-
-D. GEOPOLITICAL / MACRO CONTEXT
-Consider only developments that have a plausible transmission
-channel to the company/index, such as:
-- crude oil
-- trade restrictions
-- tariffs
-- sanctions
-- supply-chain disruption
-- currency movements
-- interest rates
-- major geopolitical conflicts
-- government/regulatory changes
-
-Do not force geopolitical explanations when they are irrelevant.
-
-E. SYNTHESIS
-Separate:
-- What the option-chain data says
-- What current external information says
-- Where the two agree
-- Where they conflict
-
-F. SCENARIOS
-Give:
-- Bullish scenario
-- Bearish scenario
-- Key invalidation/risk factors
-
-Do NOT present this as guaranteed financial advice.
-Do not claim certainty or guaranteed price targets.
-
-Use concise, Telegram-friendly formatting.
-
-End with:
-
-"Key takeaway:"
-followed by 2-4 sentences summarizing the evidence,
-uncertainties and major levels to watch.
-
-Also include a short "Sources:" section with the most relevant
-web sources used.
-"""
+    print("")
+    print("=" * 70)
+    print("RUNNING GEMINI RESEARCH")
+    print("=" * 70)
 
     try:
 
-        interaction = client.interactions.create(
-            model="gemini-3.8-flash",
-            input=prompt,
-            tools=[
-                {
-                    "type": "google_search"
-                }
-            ],
+        client = genai.Client(
+            api_key=GEMINI_API_KEY
         )
 
-        analysis = interaction.output_text
+        prompt = build_gemini_prompt(
+            metrics
+        )
 
-        if not analysis:
-            return (
-                "⚠️ Gemini returned an empty analysis."
-            )
+        grounding_tool = types.Tool(
+            google_search=types.GoogleSearch()
+        )
 
-        print("✅ Gemini analysis generated.")
-
-        # Extract grounded URLs from Gemini annotations.
-        sources = []
-
-        try:
-            for step in interaction.steps:
-
-                if getattr(step, "type", None) != "model_output":
-                    continue
-
-                for block in getattr(
-                    step,
-                    "content",
-                    []
-                ):
-
-                    annotations = getattr(
-                        block,
-                        "annotations",
-                        None
-                    )
-
-                    if not annotations:
-                        continue
-
-                    for annotation in annotations:
-
-                        if (
-                            getattr(
-                                annotation,
-                                "type",
-                                None
-                            )
-                            == "url_citation"
-                        ):
-
-                            url = getattr(
-                                annotation,
-                                "url",
-                                None
-                            )
-
-                            title = getattr(
-                                annotation,
-                                "title",
-                                None
-                            )
-
-                            if url and url not in [
-                                x[0] for x in sources
-                            ]:
-                                sources.append(
-                                    (
-                                        url,
-                                        title or url
-                                    )
-                                )
-
-        except Exception as citation_error:
-            print(
-                f"⚠️ Citation extraction warning: "
-                f"{citation_error}"
-            )
-
-        # Add source URLs only if Gemini returned them.
-        if sources:
-
-            source_lines = [
-                "\n\n<b>Sources:</b>"
+        config = types.GenerateContentConfig(
+            tools=[
+                grounding_tool
             ]
+        )
 
-            for index, (url, title) in enumerate(
-                sources[:6],
-                start=1
-            ):
-                source_lines.append(
-                    f'{index}. <a href="{url}">'
-                    f"{title}</a>"
-                )
+        response = client.models.generate_content(
+            model=GEMINI_MODEL,
+            contents=prompt,
+            config=config,
+        )
 
-            analysis += "\n".join(
-                source_lines
+        text = getattr(
+            response,
+            "text",
+            None
+        )
+
+        if not text:
+            print(
+                "Gemini returned an empty response."
             )
+            return ""
 
-        return analysis
+        print(
+            "Gemini analysis generated successfully."
+        )
+
+        return text.strip()
 
     except Exception as exc:
 
         print(
-            f"❌ Gemini analysis failed: "
+            "Gemini analysis failed:"
+        )
+
+        print(
             f"{type(exc).__name__}: {exc}"
         )
 
-        return (
-            "⚠️ Gemini analysis failed.\n"
-            f"Reason: {str(exc)[:500]}"
-        )
+        return ""
 
 
 # ============================================================
@@ -1089,10 +1197,6 @@ web sources used.
 # ============================================================
 
 def telegram_request(method, payload):
-    """
-    Telegram Bot API helper.
-    """
-
     if not TELEGRAM_BOT_TOKEN:
         raise RuntimeError(
             "TELEGRAM_BOT_TOKEN is missing."
@@ -1103,29 +1207,22 @@ def telegram_request(method, payload):
         f"{TELEGRAM_BOT_TOKEN}/{method}"
     )
 
-    response = curl_requests.post(
+    response = requests.post(
         url,
         json=payload,
         timeout=30,
-        impersonate="chrome",
     )
 
-    if response.status_code != 200:
+    response.raise_for_status()
 
+    data = response.json()
+
+    if not data.get("ok"):
         raise RuntimeError(
-            f"Telegram HTTP {response.status_code}: "
-            f"{response.text[:500]}"
+            f"Telegram API error: {data}"
         )
 
-    result = response.json()
-
-    if not result.get("ok"):
-        raise RuntimeError(
-            f"Telegram API error: "
-            f"{result}"
-        )
-
-    return result
+    return data
 
 
 def send_telegram_message(
@@ -1133,8 +1230,8 @@ def send_telegram_message(
     parse_mode="HTML"
 ):
     """
-    Telegram has a ~4096 character limit.
-    Split long Gemini responses safely.
+    Telegram has a message size limit.
+    Split long Gemini reports safely.
     """
 
     if not TELEGRAM_CHAT_ID:
@@ -1154,14 +1251,14 @@ def send_telegram_message(
             max_length
         )
 
-        if split_at <= 0:
+        if split_at < 1000:
             split_at = max_length
 
         chunks.append(
             text[:split_at]
         )
 
-        text = text[split_at:]
+        text = text[split_at:].lstrip()
 
     if text:
         chunks.append(text)
@@ -1175,124 +1272,125 @@ def send_telegram_message(
                 "text": chunk,
                 "parse_mode": parse_mode,
                 "disable_web_page_preview": True,
-            },
+            }
         )
 
         time.sleep(0.5)
 
 
 # ============================================================
-# TELEGRAM MATRIX ALERT
+# TELEGRAM MATRIX REPORT
 # ============================================================
 
 def send_matrix_telegram_alert(metrics):
     """
-    Sends the quantitative scanner result followed by
-    Gemini's contextual analysis.
+    Send the quantitative scanner result first.
+    Gemini research is sent separately afterwards.
     """
 
-    pcr_vol = metrics["PCR_Vol"]
-
-    if pcr_vol > 1:
-        signal = (
-            "🟢 VOL BREAKOUT SUPPORTED"
-        )
-    else:
-        signal = (
-            "🔴 LIQUIDITY RESISTANCE BLOCKED"
-        )
+    signal = (
+        "🟢 VOL BREAKOUT SUPPORTED"
+        if metrics["PCR_Vol"] > 1
+        else
+        "🔴 LIQUIDITY RESISTANCE BLOCKED"
+    )
 
     message = f"""
-<b>⚡ SINGULARITY MATRIX</b>
+<b>OPTION CHAIN MATRIX</b>
 
-<b>Asset:</b> {metrics["Asset"]}
-<b>Spot:</b> {metrics["Spot"]}
-<b>Expiry:</b> {metrics["Expiry"]}
+<b>Asset:</b> {html.escape(metrics["Asset"])}
+<b>Spot:</b> {format_number(metrics["Spot"])}
+<b>Expiry:</b> {html.escape(str(metrics["Expiry"]))}
 
-<b>ATM:</b> {metrics["ATM"]}
-<b>Zone:</b> {metrics["Zone_Low"]} → {metrics["Zone_High"]}
+<b>ATM:</b> {format_number(metrics["ATM"])}
 
-<b>Resistance:</b> {metrics["Resistance"]}
-<b>Resistance by Volume:</b> {metrics["Resistance_By_Volume"]}
-<b>Resistance by OI:</b> {metrics["Resistance_By_OI"]}
+<b>Resistance:</b> {format_number(metrics["Resistance"])}
+<b>Support:</b> {format_number(metrics["Support"])}
 
-<b>Support:</b> {metrics["Support"]}
-<b>Support by Volume:</b> {metrics["Support_By_Volume"]}
-<b>Support by OI:</b> {metrics["Support_By_OI"]}
+<b>Resistance by Volume:</b>
+{format_number(metrics["Resistance_By_Volume"])}
 
-<b>PCR Volume:</b> {metrics["PCR_Vol"]}
-<b>PCR OI:</b> {metrics["PCR_OI"]}
+<b>Resistance by OI:</b>
+{format_number(metrics["Resistance_By_OI"])}
 
-<b>EOR:</b> {metrics["EOR"]}
-<b>EOS:</b> {metrics["EOS"]}
+<b>Support by Volume:</b>
+{format_number(metrics["Support_By_Volume"])}
 
-<b>Resistance Strength:</b>
-{metrics["Resistance_Strength"]}
+<b>Support by OI:</b>
+{format_number(metrics["Support_By_OI"])}
 
-<b>Support Strength:</b>
-{metrics["Support_Strength"]}
+<b>PCR Volume:</b> {metrics["PCR_Vol"]:.3f}
+<b>PCR OI:</b> {metrics["PCR_OI"]:.3f}
 
-<b>Signal:</b>
+<b>EOR:</b> {format_number(metrics["EOR"])}
+<b>EOS:</b> {format_number(metrics["EOS"])}
+
+<b>EOR Status:</b>
+{html.escape(metrics["EOR_Status"])}
+
+<b>EOS Status:</b>
+{html.escape(metrics["EOS_Status"])}
+
+<b>Scanner Signal:</b>
 {signal}
-""".strip()
+
+<i>Quantitative NSE option-chain analysis.</i>
+"""
 
     send_telegram_message(
-        message
-    )
-
-    # Gemini contextual analysis
-    gemini_analysis = get_gemini_analysis(
-        metrics
-    )
-
-    send_telegram_message(
-        "<b>🤖 GEMINI CONTEXTUAL ANALYSIS</b>\n\n"
-        + gemini_analysis
+        message.strip()
     )
 
 
 # ============================================================
-# SAFETY / DATA GUARD
+# TRAGEDY GUARD
 # ============================================================
 
 def tragedy_guard(metrics):
     """
-    Basic sanity checks before sending results.
+    Basic sanity checks before sending the result.
     """
 
     required = [
-        "Asset",
         "Spot",
-        "Expiry",
+        "Resistance",
+        "Support",
         "PCR_Vol",
         "PCR_OI",
         "EOR",
         "EOS",
     ]
 
-    for field in required:
+    for key in required:
 
-        if field not in metrics:
+        value = metrics.get(key)
+
+        if value is None:
             raise RuntimeError(
-                f"Missing scanner metric: {field}"
+                f"Missing metric: {key}"
             )
+
+        if isinstance(value, float):
+
+            if math.isnan(value) or math.isinf(value):
+                raise RuntimeError(
+                    f"Invalid metric: {key}"
+                )
 
     if metrics["Spot"] <= 0:
         raise RuntimeError(
             "Invalid spot price."
         )
 
-    if metrics["EOR"] <= 0:
+    if metrics["Resistance"] <= 0:
         raise RuntimeError(
-            "Invalid EOR."
+            "Invalid resistance."
         )
 
-    if metrics["EOS"] <= 0:
+    if metrics["Support"] <= 0:
         raise RuntimeError(
-            "Invalid EOS."
+            "Invalid support."
         )
-
-    return True
 
 
 # ============================================================
@@ -1301,89 +1399,97 @@ def tragedy_guard(metrics):
 
 def main():
 
-    # GitHub Actions passes:
-    # python scanner.py "$TICKER"
+    # --------------------------------------------------------
+    # Determine ticker
+    # --------------------------------------------------------
+
+    ticker = ""
 
     if len(sys.argv) > 1:
         ticker = sys.argv[1]
 
-    else:
+    if not ticker:
         ticker = os.getenv(
             "TELEGRAM_INPUT_TICKER",
-            "NIFTY"
+            ""
         )
 
-    ticker = (
-        ticker
-        .strip()
-        .upper()
-    )
+    ticker = clean_ticker(ticker)
 
     if not ticker:
         ticker = "NIFTY"
 
-    print("=" * 60)
-    print("🚀 ALGORITHMIC OPTIONS SCANNER")
-    print("=" * 60)
-
-    print(f"Ticker: {ticker}")
-
-    print(
-        f"TELEGRAM_BOT_TOKEN: "
-        f"{'***' if TELEGRAM_BOT_TOKEN else 'MISSING'}"
-    )
+    print("")
+    print("=" * 70)
+    print("ALGORITHMIC SCANNER")
+    print("=" * 70)
 
     print(
-        f"TELEGRAM_CHAT_ID: "
-        f"{'***' if TELEGRAM_CHAT_ID else 'MISSING'}"
+        f"Ticker: {ticker}"
     )
 
-    print(
-        f"GEMINI_API_KEY: "
-        f"{'***' if GEMINI_API_KEY else 'MISSING'}"
-    )
+    # --------------------------------------------------------
+    # Select NSE API mode
+    # --------------------------------------------------------
 
     if ticker in INDEX_SYMBOLS:
-        mode = "indices"
+
+        mode = "Indices"
 
         print(
-            "📊 Index detected. "
+            "Index detected. "
             "Using NSE Indices option chain."
         )
 
     else:
-        mode = "equities"
+
+        mode = "Equity"
 
         print(
-            "📈 Equity detected. "
+            "Equity detected. "
             "Using NSE Equity option chain."
         )
 
-    try:
+    # --------------------------------------------------------
+    # Run matrix
+    # --------------------------------------------------------
 
-        print(
-            f"\n🔍 Scanning {ticker}..."
-        )
+    try:
 
         metrics = process_singularity_matrix(
             ticker,
-            mode
-        )
-
-        print("\n📊 MATRIX RESULT")
-        print(
-            json.dumps(
-                metrics,
-                indent=2
-            )
+            mode,
         )
 
         tragedy_guard(
             metrics
         )
 
+    except Exception as exc:
+
+        print("")
+        print("=" * 70)
+        print("CORE API SYNC FAILURE")
+        print("=" * 70)
+
         print(
-            "\n📨 Sending Telegram report..."
+            f"{type(exc).__name__}: {exc}"
+        )
+
+        print(
+            "Matrix processing halted."
+        )
+
+        raise
+
+    # --------------------------------------------------------
+    # Send quantitative report
+    # --------------------------------------------------------
+
+    try:
+
+        print(
+            "Sending Telegram matrix report..."
         )
 
         send_matrix_telegram_alert(
@@ -1391,43 +1497,83 @@ def main():
         )
 
         print(
-            "\n✅ COMPLETE"
+            "Telegram matrix report sent."
         )
 
     except Exception as exc:
 
         print(
-            f"\n❌ Core API Sync Failure "
-            f"for {ticker}:"
+            "Telegram matrix report failed:"
         )
 
         print(
             f"{type(exc).__name__}: {exc}"
         )
 
+    # --------------------------------------------------------
+    # Gemini research
+    # --------------------------------------------------------
+
+    gemini_analysis = get_gemini_analysis(
+        metrics
+    )
+
+    if gemini_analysis:
+
+        print("")
+        print("=" * 70)
+        print("GEMINI ANALYSIS")
+        print("=" * 70)
+
         print(
-            "⚠️ Matrix processing halted."
+            gemini_analysis
         )
 
-        # Try to notify Telegram about the failure.
+        print("=" * 70)
+
         try:
 
-            send_telegram_message(
-                f"<b>❌ Scanner Failed</b>\n\n"
-                f"<b>Asset:</b> {ticker}\n"
-                f"<b>Error:</b> "
-                f"{type(exc).__name__}: "
-                f"{str(exc)[:700]}"
+            gemini_message = (
+                "<b>GEMINI MARKET RESEARCH</b>\n\n"
+                +
+                html.escape(
+                    gemini_analysis
+                )
+                +
+                "\n\n"
+                "<i>Research generated using "
+                "current web-grounded information. "
+                "Not financial advice.</i>"
             )
 
-        except Exception as telegram_error:
+            send_telegram_message(
+                gemini_message
+            )
 
             print(
-                "⚠️ Could not send failure "
-                f"notification: {telegram_error}"
+                "Gemini analysis sent to Telegram."
             )
 
-        sys.exit(1)
+        except Exception as exc:
+
+            print(
+                "Failed to send Gemini analysis:"
+            )
+
+            print(
+                f"{type(exc).__name__}: {exc}"
+            )
+
+    else:
+
+        print(
+            "No Gemini analysis available."
+        )
+
+    print("")
+    print("=" * 70)
+    print("SCAN COMPLETE")
+    print("=" * 70)
 
 
 if __name__ == "__main__":
