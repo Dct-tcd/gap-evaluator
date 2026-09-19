@@ -1,4 +1,4 @@
-name: Run Algorithmic Scanner
+name: Run Investor Engine
 
 on:
   repository_dispatch:
@@ -8,12 +8,12 @@ on:
   workflow_dispatch:
     inputs:
       ticker:
-        description: "Target Ticker Symbol (e.g. RELIANCE)"
+        description: "Stock ticker (e.g. RELIANCE, TCS, INFY)"
         required: false
-        default: "NIFTY"
+        default: "RELIANCE"
 
 jobs:
-  scan:
+  analyze:
     runs-on: ubuntu-latest
 
     steps:
@@ -28,7 +28,12 @@ jobs:
       - name: Install Dependencies
         run: |
           python -m pip install --upgrade pip
-          pip install numpy pandas yfinance requests scipy curl_cffi google-genai
+          pip install \
+            numpy \
+            pandas \
+            requests \
+            yfinance \
+            google-genai
 
       - name: Determine Ticker
         id: ticker
@@ -45,14 +50,13 @@ jobs:
           CLEANED_INPUT=$(echo "$TICKER_INPUT" | tr '[:lower:]' '[:upper:]' | xargs)
 
           if [ -z "$CLEANED_INPUT" ]; then
-            CLEANED_INPUT="NIFTY"
+            CLEANED_INPUT="RELIANCE"
           fi
 
           echo "ticker=$CLEANED_INPUT" >> "$GITHUB_OUTPUT"
-
           echo "TICKER: $CLEANED_INPUT"
 
-      - name: Run Processing Engine
+      - name: Run Investor Engine
         env:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
@@ -60,6 +64,6 @@ jobs:
         run: |
           TICKER="${{ steps.ticker.outputs.ticker }}"
 
-          echo "Starting scanner for $TICKER..."
+          echo "Starting investor analysis for $TICKER..."
 
           python scanner.py "$TICKER"
