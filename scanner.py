@@ -1,1195 +1,771 @@
 import os
 import sys
-import time
 import math
 import html
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 
+import numpy as np
 import pandas as pd
 import requests
-from curl_cffi import requests as curl_requests
+import yfinance as yf
+from google import genai
+from google.genai import types
 
 
 # ============================================================
-# CONFIGURATION
+# CONFIG
 # ============================================================
-
-NSE_HOME = "https://www.nseindia.com"
-NSE_OPTION_CHAIN_PAGE = "https://www.nseindia.com/option-chain"
-
-NSE_CONTRACT_INFO = (
-    "https://www.nseindia.com/api/option-chain-contract-info"
-)
-
-NSE_OPTION_CHAIN_V3 = (
-    "https://www.nseindia.com/api/option-chain-v3"
-)
-
-TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
-TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "").strip()
-
-GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "").strip()
 
 GEMINI_MODEL = "gemini-3.8-flash"
 
-INDEX_SYMBOLS = {
-    "NIFTY",
-    "BANKNIFTY",
-    "FINNIFTY",
-}
+TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
+TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "").strip()
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "").strip()
+
+# Yahoo Finance symbols for Indian equities.
+# User can enter RELIANCE, TCS, INFY, HDFCBANK, etc.
+# We try NSE first and BSE second.
+BENCHMARK = "^NSEI"       # NIFTY 50
+VOLATILITY_INDEX = "^INDIAVIX"
 
 
 # ============================================================
 # GENERIC HELPERS
 # ============================================================
 
-def safe_float(value, default=0.0):
+def safe_float(value, default=None):
     try:
         if value is None:
             return default
-
-        if isinstance(value, str):
-            value = value.replace(",", "").strip()
-
-        result = float(value)
-
-        if math.isnan(result) or math.isinf(result):
+        value = float(value)
+        if not math.isfinite(value):
             return default
-
-        return result
-
-    except (ValueError, TypeError):
+        return value
+    except (TypeError, ValueError):
         return default
 
 
-def safe_int(value, default=0):
-    try:
-        if value is None:
-            return default
+def fmt_num(value, decimals=2):
+    value = safe_float(value)
+    if value is None:
+        return "N/A"
+    return f"{value:,.{decimals}f}"
 
-        if isinstance(value, str):
-            value = value.replace(",", "").strip()
 
-        return int(float(value))
+def fmt_pct(value, decimals=2):
+    value = safe_float(value)
+    if value is None:
+        return "N/A"
+    return f"{value:+.{decimals}f}%"
 
-    except (ValueError, TypeError):
-        return default
 
+def fmt_money(value):
+    value = safe_float(value)
+    if value is None:
+        return "N/A"
 
-def clean_ticker(value):
-    if not value:
-        return ""
+    if abs(value) >= 1e12:
+        return f"₹{value / 1e12:.2f}T"
+    if abs(value) >= 1e9:
+        return f"₹{value / 1e9:.2f}B"
+    if abs(value) >= 1e7:
+        return f"₹{value / 1e7:.2f}Cr"
+    if abs(value) >= 1e5:
+        return f"₹{value / 1e5:.2f}L"
+    return f"₹{value:,.2f}"
 
-    return (
-        str(value)
-        .strip()
-        .upper()
-        .replace(" ", "")
-    )
 
+def clean_ticker(raw):
+    ticker = (raw or "").strip().upper()
 
-def format_number(value):
-    try:
-        return f"{float(value):,.2f}"
-    except Exception:
-        return str(value)
+    for suffix in (".NS", ".BO"):
+        if ticker.endswith(suffix):
+            ticker = ticker[:-3]
 
+    ticker = ticker.replace(" ", "")
 
-def format_integer(value):
-    try:
-        return f"{int(value):,}"
-    except Exception:
-        return str(value)
+    if not ticker:
+        return "RELIANCE"
 
+    return ticker
 
-# ============================================================
-# NSE SESSION
-# ============================================================
 
-def create_nse_session():
-    """
-    NSE is much more reliable when accessed through a browser-like
-    session with cookies and realistic headers.
-    """
+def yahoo_candidates(ticker):
+    # Allow direct Yahoo symbols such as ^NSEI.
+    if ticker.startswith("^"):
+        return [ticker]
 
-    session = curl_requests.Session(
-        impersonate="chrome"
-    )
+    return [f"{ticker}.NS", f"{ticker}.BO"]
 
-    session.headers.update({
-        "User-Agent": (
-            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-            "AppleWebKit/537.36 (KHTML, like Gecko) "
-            "Chrome/140.0.0.0 Safari/537.36"
-        ),
-        "Accept": (
-            "text/html,application/xhtml+xml,"
-            "application/xml;q=0.9,image/avif,image/webp,"
-            "image/apng,*/*;q=0.8"
-        ),
-        "Accept-Language": "en-US,en;q=0.9",
-        "Accept-Encoding": "gzip, deflate, br",
-        "Connection": "keep-alive",
-        "Upgrade-Insecure-Requests": "1",
-    })
 
-    return session
-
-
-def warm_nse_session(session):
-    """
-    Establish NSE cookies before hitting API endpoints.
-    """
-
-    print("Warming NSE session...")
-
-    try:
-        response = session.get(
-            NSE_HOME,
-            timeout=20,
-            allow_redirects=True,
-        )
-
-        print(
-            f"NSE home: {response.status_code} "
-            f"{response.url}"
-        )
-
-    except Exception as exc:
-        print(f"NSE home warm-up warning: {exc}")
-
-    try:
-        response = session.get(
-            NSE_OPTION_CHAIN_PAGE,
-            timeout=20,
-            allow_redirects=True,
-        )
-
-        print(
-            f"NSE option-chain page: "
-            f"{response.status_code}"
-        )
-
-    except Exception as exc:
-        print(
-            f"NSE option-chain warm-up warning: "
-            f"{exc}"
-        )
-
-    time.sleep(0.8)
-
-
-def nse_get(session, url, params=None):
-    """
-    GET request against NSE with browser-like headers.
-    """
-
-    headers = {
-        "Accept": "application/json,text/plain,*/*",
-        "Referer": NSE_OPTION_CHAIN_PAGE,
-        "Sec-Fetch-Dest": "empty",
-        "Sec-Fetch-Mode": "cors",
-        "Sec-Fetch-Site": "same-origin",
-    }
-
-    response = session.get(
-        url,
-        params=params,
-        headers=headers,
-        timeout=30,
-    )
-
-    print(
-        f"NSE API: {response.status_code} "
-        f"{response.url}"
-    )
-
-    response.raise_for_status()
-
-    try:
-        return response.json()
-
-    except Exception as exc:
-        print("NSE returned non-JSON response.")
-        print(response.text[:1000])
-        raise RuntimeError(
-            f"Unable to decode NSE JSON: {exc}"
-        )
-
-
-# ============================================================
-# NSE EXPIRY
-# ============================================================
-
-def extract_expiry_dates(raw):
-    """
-    NSE has changed the nesting of expiry information across
-    endpoint versions. Search several known structures.
-    """
-
-    candidates = []
-
-    def collect(obj):
-        if isinstance(obj, dict):
-
-            for key in (
-                "expiryDates",
-                "expiryDate",
-                "expiries",
-            ):
-                value = obj.get(key)
-
-                if isinstance(value, list):
-                    candidates.extend(value)
-
-                elif isinstance(value, str):
-                    candidates.append(value)
-
-            for value in obj.values():
-                if isinstance(value, (dict, list)):
-                    collect(value)
-
-        elif isinstance(obj, list):
-            for item in obj:
-                collect(item)
-
-    collect(raw)
-
-    cleaned = []
-
-    for item in candidates:
-
-        if not isinstance(item, str):
-            continue
-
-        item = item.strip()
-
-        if item and item not in cleaned:
-            cleaned.append(item)
-
-    return cleaned
-
-
-def get_nearest_expiry(session, symbol, mode):
-    """
-    Fetch available expiries from NSE contract-info endpoint.
-    """
-
-    print(
-        f"Fetching expiry information for "
-        f"{symbol}..."
-    )
-
-    params = {
-        "symbol": symbol,
-        "type": mode,
-    }
-
-    raw = nse_get(
-        session,
-        NSE_CONTRACT_INFO,
-        params=params,
-    )
-
-    expiry_dates = extract_expiry_dates(raw)
-
-    if not expiry_dates:
-
-        # Fallback to older records-style response.
-        records = raw.get("records", {})
-
-        expiry_dates = records.get(
-            "expiryDates",
-            []
-        )
-
-    if not expiry_dates:
-        raise RuntimeError(
-            "NSE did not return any expiry dates."
-        )
-
-    expiry = expiry_dates[0]
-
-    print(
-        f"Nearest expiry for {symbol}: "
-        f"{expiry}"
-    )
-
-    return expiry
-
-
-# ============================================================
-# NSE OPTION CHAIN
-# ============================================================
-
-def fetch_nse_option_chain(symbol, mode):
-    """
-    Fetch current NSE option-chain-v3 data.
-    """
-
-    session = create_nse_session()
-
-    warm_nse_session(session)
-
-    expiry = get_nearest_expiry(
-        session,
-        symbol,
-        mode,
-    )
-
-    print(
-        f"Fetching v3 option chain for "
-        f"{symbol} / {expiry}..."
-    )
-
-    params = {
-        "type": mode,
-        "symbol": symbol,
-        "expiry": expiry,
-    }
-
-    raw = nse_get(
-        session,
-        NSE_OPTION_CHAIN_V3,
-        params=params,
-    )
-
-    # Count rows for diagnostics.
-    rows = []
-
-    if isinstance(raw.get("filtered"), dict):
-        rows = raw["filtered"].get("data", [])
-
-    if not rows and isinstance(raw.get("records"), dict):
-        rows = raw["records"].get("data", [])
-
-    print(
-        f"Received {len(rows)} NSE "
-        f"option-chain rows."
-    )
-
-    if not rows:
-        raise RuntimeError(
-            "NSE returned no option-chain rows."
-        )
-
-    return raw, expiry
-
-
-# ============================================================
-# OPTION CHAIN PARSER
-# ============================================================
-
-def build_option_dataframe(raw_data, expiry):
-    """
-    Convert NSE option-chain-v3 JSON into a normalized dataframe.
-
-    Supports both:
-
-        filtered.data
-
-    and:
-
-        records.data
-
-    NSE's v3 endpoint already receives the requested expiry,
-    so we intentionally do NOT reject rows merely because
-    expiry fields inside CE/PE are missing.
-    """
-
-    filtered = raw_data.get("filtered", {})
-    records = raw_data.get("records", {})
-
-    rows = []
-
-    if isinstance(filtered, dict):
-        rows = filtered.get("data", [])
-
-    if not rows and isinstance(records, dict):
-        rows = records.get("data", [])
-
-    if not rows:
-        raise RuntimeError(
-            "NSE returned no option-chain data rows."
-        )
-
-    print(
-        f"Parsing {len(rows)} option-chain rows..."
-    )
-
-    normalized = []
-
-    for item in rows:
-
-        if not isinstance(item, dict):
-            continue
-
-        strike = safe_float(
-            item.get("strikePrice")
-        )
-
-        if strike <= 0:
-            continue
-
-        ce = item.get("CE")
-
-        if not isinstance(ce, dict):
-            ce = {}
-
-        pe = item.get("PE")
-
-        if not isinstance(pe, dict):
-            pe = {}
-
-        normalized.append({
-            "Strike": strike,
-
-            "CE_Volume": safe_int(
-                ce.get("totalTradedVolume", 0)
-            ),
-
-            "PE_Volume": safe_int(
-                pe.get("totalTradedVolume", 0)
-            ),
-
-            "CE_OI": safe_int(
-                ce.get("openInterest", 0)
-            ),
-
-            "PE_OI": safe_int(
-                pe.get("openInterest", 0)
-            ),
-
-            "CE_LTP": safe_float(
-                ce.get("lastPrice", 0)
-            ),
-
-            "PE_LTP": safe_float(
-                pe.get("lastPrice", 0)
-            ),
-
-            "CE_Change_OI": safe_int(
-                ce.get("changeinOpenInterest", 0)
-            ),
-
-            "PE_Change_OI": safe_int(
-                pe.get("changeinOpenInterest", 0)
-            ),
-
-            "CE_IV": safe_float(
-                ce.get("impliedVolatility", 0)
-            ),
-
-            "PE_IV": safe_float(
-                pe.get("impliedVolatility", 0)
-            ),
-        })
-
-    if not normalized:
-
-        # Very useful diagnostic if NSE changes the schema again.
-        first_row = rows[0]
-
-        print(
-            "First NSE row keys:",
-            list(first_row.keys())
-        )
-
-        print(
-            "First NSE row sample:",
-            str(first_row)[:2500]
-        )
-
-        raise RuntimeError(
-            "NSE returned option-chain rows, "
-            "but none contained a valid strikePrice."
-        )
-
-    df = pd.DataFrame(normalized)
-
-    df = (
-        df
-        .drop_duplicates(
-            subset=["Strike"]
-        )
-        .sort_values("Strike")
-        .reset_index(drop=True)
-    )
-
-    if df.empty:
-        raise RuntimeError(
-            "Option dataframe is empty after parsing."
-        )
-
-    print(
-        f"Successfully parsed "
-        f"{len(df)} strikes."
-    )
-
-    print(
-        f"Strike range: "
-        f"{df['Strike'].min()} "
-        f"→ "
-        f"{df['Strike'].max()}"
-    )
-
-    print(
-        f"CE OI: "
-        f"{int(df['CE_OI'].sum()):,}"
-    )
-
-    print(
-        f"PE OI: "
-        f"{int(df['PE_OI'].sum()):,}"
-    )
-
-    print(
-        f"CE Volume: "
-        f"{int(df['CE_Volume'].sum()):,}"
-    )
-
-    print(
-        f"PE Volume: "
-        f"{int(df['PE_Volume'].sum()):,}"
-    )
-
-    return df
-
-
-# ============================================================
-# SPOT PRICE
-# ============================================================
-
-def get_spot_price(raw_data, df):
-    """
-    Extract underlying spot price from NSE response.
-    """
-
-    records = raw_data.get("records", {})
-
-    if isinstance(records, dict):
-
-        value = safe_float(
-            records.get(
-                "underlyingValue",
-                0
-            )
-        )
-
-        if value > 0:
+def first_not_none(*values):
+    for value in values:
+        if value is not None:
             return value
-
-    filtered = raw_data.get("filtered", {})
-
-    if isinstance(filtered, dict):
-
-        for item in filtered.get("data", []):
-
-            if not isinstance(item, dict):
-                continue
-
-            ce = item.get("CE") or {}
-            pe = item.get("PE") or {}
-
-            for side in (ce, pe):
-
-                value = safe_float(
-                    side.get(
-                        "underlyingValue",
-                        0
-                    )
-                )
-
-                if value > 0:
-                    return value
-
-    if isinstance(records, dict):
-
-        for item in records.get("data", []):
-
-            if not isinstance(item, dict):
-                continue
-
-            ce = item.get("CE") or {}
-            pe = item.get("PE") or {}
-
-            for side in (ce, pe):
-
-                value = safe_float(
-                    side.get(
-                        "underlyingValue",
-                        0
-                    )
-                )
-
-                if value > 0:
-                    return value
-
-    # Last-resort fallback.
-    if not df.empty:
-        return float(
-            df["Strike"].median()
-        )
-
-    return 0.0
+    return None
 
 
 # ============================================================
-# STRIKE STEP
+# YAHOO FINANCE
 # ============================================================
 
-def calculate_strike_step(df):
-    strikes = sorted(
-        set(
-            safe_float(x)
-            for x in df["Strike"].tolist()
-        )
-    )
-
-    differences = []
-
-    for i in range(1, len(strikes)):
-
-        diff = strikes[i] - strikes[i - 1]
-
-        if diff > 0:
-            differences.append(diff)
-
-    if not differences:
-        return 1.0
-
-    # Most common / smallest sensible increment.
-    differences.sort()
-
-    return float(
-        differences[len(differences) // 2]
-    )
-
-
-# ============================================================
-# SINGULARITY MATRIX
-# ============================================================
-
-def process_singularity_matrix(symbol, mode):
+def resolve_yahoo_ticker(ticker):
     """
-    Main quantitative option-chain engine.
+    Resolve an Indian equity to NSE first, then BSE.
     """
+    last_error = None
 
-    print("")
-    print("=" * 70)
-    print(f"SCANNING {symbol}")
-    print("=" * 70)
+    for symbol in yahoo_candidates(ticker):
+        try:
+            stock = yf.Ticker(symbol)
+            hist = stock.history(period="5d", auto_adjust=False)
 
-    raw_data, expiry = fetch_nse_option_chain(
-        symbol,
-        mode,
+            if hist is not None and not hist.empty:
+                print(f"Yahoo symbol resolved: {symbol}")
+                return symbol, stock
+        except Exception as exc:
+            last_error = exc
+
+    raise RuntimeError(
+        f"Could not resolve {ticker} on Yahoo Finance. "
+        f"Tried {yahoo_candidates(ticker)}. Error: {last_error}"
     )
 
-    df = build_option_dataframe(
-        raw_data,
-        expiry,
-    )
 
-    spot = get_spot_price(
-        raw_data,
-        df,
-    )
+def clean_dataframe(df):
+    if df is None or df.empty:
+        return None
 
-    if spot <= 0:
+    result = df.copy()
+
+    # yfinance can occasionally return timezone-aware indexes.
+    try:
+        result.index = pd.to_datetime(result.index)
+    except Exception:
+        pass
+
+    return result
+
+
+def calculate_rsi(close, period=14):
+    delta = close.diff()
+
+    gain = delta.clip(lower=0)
+    loss = -delta.clip(upper=0)
+
+    avg_gain = gain.ewm(alpha=1 / period, min_periods=period, adjust=False).mean()
+    avg_loss = loss.ewm(alpha=1 / period, min_periods=period, adjust=False).mean()
+
+    rs = avg_gain / avg_loss.replace(0, np.nan)
+    rsi = 100 - (100 / (1 + rs))
+
+    return rsi
+
+
+def calculate_atr(df, period=14):
+    high = df["High"]
+    low = df["Low"]
+    close = df["Close"]
+
+    previous_close = close.shift(1)
+
+    true_range = pd.concat(
+        [
+            high - low,
+            (high - previous_close).abs(),
+            (low - previous_close).abs(),
+        ],
+        axis=1,
+    ).max(axis=1)
+
+    return true_range.rolling(period).mean()
+
+
+def calculate_technical_snapshot(hist):
+    hist = clean_dataframe(hist)
+
+    if hist is None or len(hist) < 30:
         raise RuntimeError(
-            "Could not determine underlying spot price."
+            "Not enough historical price data to calculate the technical snapshot."
         )
 
-    strike_step = calculate_strike_step(
-        df
+    close = hist["Close"].dropna()
+    volume = hist["Volume"].fillna(0)
+
+    latest_price = safe_float(close.iloc[-1])
+    previous_close = safe_float(close.iloc[-2])
+
+    sma20 = safe_float(close.rolling(20).mean().iloc[-1])
+    sma50 = safe_float(close.rolling(50).mean().iloc[-1]) if len(close) >= 50 else None
+    sma200 = safe_float(close.rolling(200).mean().iloc[-1]) if len(close) >= 200 else None
+
+    rsi_series = calculate_rsi(close)
+    rsi14 = safe_float(rsi_series.iloc[-1])
+
+    atr_series = calculate_atr(hist)
+    atr14 = safe_float(atr_series.iloc[-1])
+
+    avg_volume20 = safe_float(volume.rolling(20).mean().iloc[-1])
+    latest_volume = safe_float(volume.iloc[-1])
+
+    volume_ratio = None
+    if avg_volume20 and avg_volume20 > 0:
+        volume_ratio = latest_volume / avg_volume20
+
+    def period_return(days):
+        if len(close) <= days:
+            return None
+        old = safe_float(close.iloc[-days - 1])
+        if old in (None, 0):
+            return None
+        return ((latest_price / old) - 1) * 100
+
+    recent_20 = close.tail(20)
+    recent_60 = close.tail(min(60, len(close)))
+
+    high20 = safe_float(recent_20.max())
+    low20 = safe_float(recent_20.min())
+
+    high60 = safe_float(recent_60.max())
+    low60 = safe_float(recent_60.min())
+
+    distance_from_high20 = (
+        ((latest_price / high20) - 1) * 100
+        if latest_price is not None and high20
+        else None
     )
 
-    # Nearest ATM strike.
-    atm_row = (
-        df.iloc[
-            (
-                df["Strike"] - spot
-            ).abs().argsort()[:1]
-        ]
+    distance_from_low20 = (
+        ((latest_price / low20) - 1) * 100
+        if latest_price is not None and low20
+        else None
     )
 
-    atm = float(
-        atm_row.iloc[0]["Strike"]
-    )
-
-    # 5 strikes above and below ATM.
-    zone_low = atm - (
-        strike_step * 5
-    )
-
-    zone_high = atm + (
-        strike_step * 5
-    )
-
-    zone = df[
-        (df["Strike"] >= zone_low)
-        &
-        (df["Strike"] <= zone_high)
-    ].copy()
-
-    if zone.empty:
-        zone = df.copy()
-
-    # --------------------------------------------------------
-    # RESISTANCE
-    # --------------------------------------------------------
-
-    resistance_by_oi = zone.loc[
-        zone["CE_OI"].idxmax()
-    ]
-
-    resistance_by_volume = zone.loc[
-        zone["CE_Volume"].idxmax()
-    ]
-
-    # Primary resistance = strongest CE OI.
-    resistance = float(
-        resistance_by_oi["Strike"]
-    )
-
-    # --------------------------------------------------------
-    # SUPPORT
-    # --------------------------------------------------------
-
-    support_by_oi = zone.loc[
-        zone["PE_OI"].idxmax()
-    ]
-
-    support_by_volume = zone.loc[
-        zone["PE_Volume"].idxmax()
-    ]
-
-    # Primary support = strongest PE OI.
-    support = float(
-        support_by_oi["Strike"]
-    )
-
-    # --------------------------------------------------------
-    # PCR
-    # --------------------------------------------------------
-
-    total_ce_volume = float(
-        zone["CE_Volume"].sum()
-    )
-
-    total_pe_volume = float(
-        zone["PE_Volume"].sum()
-    )
-
-    total_ce_oi = float(
-        zone["CE_OI"].sum()
-    )
-
-    total_pe_oi = float(
-        zone["PE_OI"].sum()
-    )
-
-    pcr_volume = (
-        total_pe_volume / total_ce_volume
-        if total_ce_volume > 0
-        else 0.0
-    )
-
-    pcr_oi = (
-        total_pe_oi / total_ce_oi
-        if total_ce_oi > 0
-        else 0.0
-    )
-
-    # --------------------------------------------------------
-    # EOR / EOS
-    # --------------------------------------------------------
-
-    resistance_ce_ltp = safe_float(
-        resistance_by_oi["CE_LTP"]
-    )
-
-    support_pe_ltp = safe_float(
-        support_by_oi["PE_LTP"]
-    )
-
-    eor = resistance + resistance_ce_ltp
-
-    eos = support - support_pe_ltp
-
-    # --------------------------------------------------------
-    # STRENGTH
-    # --------------------------------------------------------
-
-    resistance_oi = safe_float(
-        resistance_by_oi["CE_OI"]
-    )
-
-    support_oi = safe_float(
-        support_by_oi["PE_OI"]
-    )
-
-    resistance_volume = safe_int(
-        resistance_by_volume["CE_Volume"]
-    )
-
-    support_volume = safe_int(
-        support_by_volume["PE_Volume"]
-    )
-
-    if pcr_volume > 1.0:
-        eor_status = "VOL BREAKOUT SUPPORTED"
-    else:
-        eor_status = "LIQUIDITY RESISTANCE BLOCKED"
-
-    if pcr_oi > 1.0:
-        eos_status = "PUT OI SUPPORTIVE"
-    else:
-        eos_status = "CALL OI DOMINANT"
-
-    resistance_strength = (
-        "STRONG"
-        if resistance_oi >= support_oi
-        else "MODERATE"
-    )
-
-    support_strength = (
-        "STRONG"
-        if support_oi >= resistance_oi
-        else "MODERATE"
-    )
-
-    metrics = {
-        "Asset": symbol,
-        "Spot": spot,
-        "Expiry": expiry,
-        "ATM": atm,
-        "Strike_Step": strike_step,
-
-        "Zone_Low": zone_low,
-        "Zone_High": zone_high,
-
-        "Resistance": resistance,
-        "Resistance_By_Volume": float(
-            resistance_by_volume["Strike"]
-        ),
-        "Resistance_By_OI": float(
-            resistance_by_oi["Strike"]
-        ),
-
-        "Support": support,
-        "Support_By_Volume": float(
-            support_by_volume["Strike"]
-        ),
-        "Support_By_OI": float(
-            support_by_oi["Strike"]
-        ),
-
-        "CE_Max_Volume": resistance_volume,
-        "CE_Max_OI": resistance_oi,
-
-        "PE_Max_Volume": support_volume,
-        "PE_Max_OI": support_oi,
-
-        "PCR_Vol": pcr_volume,
-        "PCR_OI": pcr_oi,
-
-        "EOR": eor,
-        "EOR_Type": "CE OI + CE LTP",
-        "EOR_Status": eor_status,
-
-        "EOS": eos,
-        "EOS_Type": "PE OI - PE LTP",
-        "EOS_Status": eos_status,
-
-        "Resistance_Strength": resistance_strength,
-        "Support_Strength": support_strength,
-
-        "Timestamp": datetime.now(
-            timezone.utc
-        ).isoformat(),
+    return {
+        "latest_price": latest_price,
+        "previous_close": previous_close,
+        "return_1d": period_return(1),
+        "return_5d": period_return(5),
+        "return_20d": period_return(20),
+        "return_60d": period_return(60),
+        "sma20": sma20,
+        "sma50": sma50,
+        "sma200": sma200,
+        "rsi14": rsi14,
+        "atr14": atr14,
+        "atr_pct": (atr14 / latest_price * 100)
+        if atr14 is not None and latest_price
+        else None,
+        "latest_volume": latest_volume,
+        "avg_volume20": avg_volume20,
+        "volume_ratio": volume_ratio,
+        "high20": high20,
+        "low20": low20,
+        "high60": high60,
+        "low60": low60,
+        "distance_from_high20": distance_from_high20,
+        "distance_from_low20": distance_from_low20,
+        "above_sma20": latest_price > sma20 if latest_price and sma20 else None,
+        "above_sma50": latest_price > sma50 if latest_price and sma50 else None,
+        "above_sma200": latest_price > sma200 if latest_price and sma200 else None,
     }
 
-    # --------------------------------------------------------
-    # PRINT MATRIX
-    # --------------------------------------------------------
 
-    print("")
-    print("=" * 70)
-    print("MATRIX RESULT")
-    print("=" * 70)
+def calculate_benchmark_snapshot():
+    try:
+        benchmark = yf.Ticker(BENCHMARK)
+        hist = benchmark.history(period="6mo", auto_adjust=False)
 
-    print(
-        f"Asset              : {symbol}"
-    )
+        if hist is None or hist.empty:
+            return {}
 
-    print(
-        f"Spot               : "
-        f"{format_number(spot)}"
-    )
+        close = hist["Close"].dropna()
 
-    print(
-        f"Expiry             : {expiry}"
-    )
+        latest = safe_float(close.iloc[-1])
+        return {
+            "nifty_price": latest,
+            "nifty_1d": (
+                ((latest / safe_float(close.iloc[-2])) - 1) * 100
+                if len(close) >= 2 and safe_float(close.iloc[-2])
+                else None
+            ),
+            "nifty_5d": (
+                ((latest / safe_float(close.iloc[-6])) - 1) * 100
+                if len(close) >= 6 and safe_float(close.iloc[-6])
+                else None
+            ),
+            "nifty_20d": (
+                ((latest / safe_float(close.iloc[-21])) - 1) * 100
+                if len(close) >= 21 and safe_float(close.iloc[-21])
+                else None
+            ),
+        }
+    except Exception as exc:
+        print(f"Benchmark data unavailable: {exc}")
+        return {}
 
-    print(
-        f"ATM                : "
-        f"{format_number(atm)}"
-    )
 
-    print(
-        f"Strike Step        : "
-        f"{format_number(strike_step)}"
-    )
+def calculate_vix():
+    try:
+        vix = yf.Ticker(VOLATILITY_INDEX)
+        hist = vix.history(period="10d", auto_adjust=False)
 
-    print(
-        f"Resistance         : "
-        f"{format_number(resistance)}"
-    )
+        if hist is None or hist.empty:
+            return None
 
-    print(
-        f"Support            : "
-        f"{format_number(support)}"
-    )
+        return safe_float(hist["Close"].dropna().iloc[-1])
+    except Exception as exc:
+        print(f"India VIX unavailable: {exc}")
+        return None
 
-    print(
-        f"PCR Volume         : "
-        f"{pcr_volume:.3f}"
-    )
 
-    print(
-        f"PCR OI             : "
-        f"{pcr_oi:.3f}"
-    )
+# ============================================================
+# FUNDAMENTALS
+# ============================================================
 
-    print(
-        f"EOR                : "
-        f"{format_number(eor)}"
-    )
+def extract_info(stock):
+    try:
+        info = stock.get_info()
+        if isinstance(info, dict):
+            return info
+    except Exception as exc:
+        print(f"Yahoo info unavailable: {exc}")
 
-    print(
-        f"EOS                : "
-        f"{format_number(eos)}"
-    )
+    try:
+        info = stock.info
+        if isinstance(info, dict):
+            return info
+    except Exception as exc:
+        print(f"Yahoo fallback info unavailable: {exc}")
 
-    print(
-        f"EOR Status         : "
-        f"{eor_status}"
-    )
+    return {}
 
-    print(
-        f"EOS Status         : "
-        f"{eos_status}"
-    )
 
-    print("=" * 70)
+def get_financial_statement_snapshot(stock):
+    """
+    Pull a compact set of financial metrics from Yahoo.
+    Missing fields are kept as N/A rather than guessed.
+    """
+    result = {
+        "revenue": None,
+        "net_income": None,
+        "operating_cashflow": None,
+        "free_cashflow": None,
+        "total_debt": None,
+        "cash": None,
+        "equity": None,
+    }
 
-    return metrics
+    try:
+        income = stock.quarterly_income_stmt
+        if income is not None and not income.empty:
+            col = income.columns[0]
+
+            def row_value(names):
+                for name in names:
+                    if name in income.index:
+                        return safe_float(income.loc[name, col])
+                return None
+
+            result["revenue"] = row_value(["Total Revenue", "Operating Revenue"])
+            result["net_income"] = row_value(["Net Income", "Net Income Common Stockholders"])
+    except Exception as exc:
+        print(f"Income statement unavailable: {exc}")
+
+    try:
+        cashflow = stock.quarterly_cashflow
+        if cashflow is not None and not cashflow.empty:
+            col = cashflow.columns[0]
+
+            def row_value(names):
+                for name in names:
+                    if name in cashflow.index:
+                        return safe_float(cashflow.loc[name, col])
+                return None
+
+            result["operating_cashflow"] = row_value(
+                ["Operating Cash Flow", "Total Cash From Operating Activities"]
+            )
+            result["free_cashflow"] = row_value(["Free Cash Flow"])
+    except Exception as exc:
+        print(f"Cash-flow statement unavailable: {exc}")
+
+    try:
+        balance = stock.quarterly_balance_sheet
+        if balance is not None and not balance.empty:
+            col = balance.columns[0]
+
+            def row_value(names):
+                for name in names:
+                    if name in balance.index:
+                        return safe_float(balance.loc[name, col])
+                return None
+
+            result["total_debt"] = row_value(
+                ["Total Debt", "Total Debt And Capital Lease Obligation"]
+            )
+            result["cash"] = row_value(
+                ["Cash Cash Equivalents And Short Term Investments",
+                 "Cash And Cash Equivalents"]
+            )
+            result["equity"] = row_value(
+                ["Stockholders Equity", "Common Stock Equity"]
+            )
+    except Exception as exc:
+        print(f"Balance sheet unavailable: {exc}")
+
+    return result
+
+
+def calculate_fundamental_snapshot(info, statements):
+    return {
+        "company_name": info.get("longName") or info.get("shortName"),
+        "sector": info.get("sector"),
+        "industry": info.get("industry"),
+        "website": info.get("website"),
+        "market_cap": info.get("marketCap"),
+        "trailing_pe": first_not_none(
+            info.get("trailingPE"),
+            info.get("forwardPE"),
+        ),
+        "forward_pe": info.get("forwardPE"),
+        "price_to_book": info.get("priceToBook"),
+        "enterprise_to_ebitda": info.get("enterpriseToEbitda"),
+        "peg_ratio": info.get("pegRatio"),
+        "dividend_yield": info.get("dividendYield"),
+        "return_on_equity": info.get("returnOnEquity"),
+        "return_on_assets": info.get("returnOnAssets"),
+        "profit_margin": info.get("profitMargins"),
+        "operating_margin": info.get("operatingMargins"),
+        "revenue_growth": info.get("revenueGrowth"),
+        "earnings_growth": info.get("earningsGrowth"),
+        "debt_to_equity": info.get("debtToEquity"),
+        "current_ratio": info.get("currentRatio"),
+        "beta": info.get("beta"),
+        **statements,
+    }
+
+
+def get_calendar_snapshot(stock):
+    try:
+        calendar = stock.calendar
+
+        if calendar is None:
+            return {}
+
+        if isinstance(calendar, dict):
+            return calendar
+
+        # Newer yfinance versions can expose a DataFrame.
+        if isinstance(calendar, pd.DataFrame):
+            return calendar.to_dict()
+
+    except Exception as exc:
+        print(f"Calendar unavailable: {exc}")
+
+    return {}
+
+
+def get_yahoo_news(stock):
+    try:
+        news = stock.get_news(count=10, tab="all")
+
+        if not news:
+            return []
+
+        cleaned = []
+
+        for item in news[:10]:
+            content = item.get("content", item)
+
+            title = content.get("title")
+            publisher = content.get("provider", {}).get("displayName")
+            url = (
+                content.get("canonicalUrl", {}).get("url")
+                or content.get("clickThroughUrl", {}).get("url")
+            )
+
+            if title:
+                cleaned.append({
+                    "title": title,
+                    "publisher": publisher,
+                    "url": url,
+                })
+
+        return cleaned
+
+    except Exception as exc:
+        print(f"Yahoo news unavailable: {exc}")
+        return []
+
+
+# ============================================================
+# SERIALIZATION FOR GEMINI
+# ============================================================
+
+def compact_json_safe(obj):
+    """
+    Convert numpy/pandas/date-like objects into JSON-friendly strings.
+    """
+    if obj is None:
+        return None
+
+    if isinstance(obj, (str, int, float, bool)):
+        if isinstance(obj, float) and not math.isfinite(obj):
+            return None
+        return obj
+
+    if isinstance(obj, (np.integer,)):
+        return int(obj)
+
+    if isinstance(obj, (np.floating,)):
+        value = float(obj)
+        return value if math.isfinite(value) else None
+
+    if isinstance(obj, pd.Timestamp):
+        return obj.isoformat()
+
+    if isinstance(obj, dict):
+        return {str(k): compact_json_safe(v) for k, v in obj.items()}
+
+    if isinstance(obj, list):
+        return [compact_json_safe(v) for v in obj]
+
+    return str(obj)
+
+
+def build_research_packet(
+    ticker,
+    yahoo_symbol,
+    technical,
+    fundamentals,
+    benchmark,
+    vix,
+    calendar,
+    yahoo_news,
+):
+    return {
+        "analysis_timestamp_utc": datetime.now(timezone.utc).isoformat(),
+        "ticker": ticker,
+        "yahoo_symbol": yahoo_symbol,
+        "market": "India",
+        "benchmark": "NIFTY 50",
+        "technical": compact_json_safe(technical),
+        "fundamentals": compact_json_safe(fundamentals),
+        "market_context": compact_json_safe({
+            "benchmark": benchmark,
+            "india_vix": vix,
+        }),
+        "upcoming_events": compact_json_safe(calendar),
+        "recent_yahoo_news": compact_json_safe(yahoo_news),
+    }
 
 
 # ============================================================
 # GEMINI ANALYSIS
 # ============================================================
 
-def build_gemini_prompt(metrics):
-    """
-    Prompt Gemini to combine the quantitative scanner output
-    with current web information.
-
-    The model is explicitly asked to separate facts from
-    interpretation and avoid inventing news.
-    """
-
+def build_gemini_prompt(packet):
     return f"""
-You are the research and analysis layer of an Indian market
-option-chain scanner.
+You are an evidence-driven stock research assistant for an Indian investor.
 
-Analyze the following quantitative NSE option-chain output
-for {metrics['Asset']}.
+The investor enters an NSE/BSE stock and wants to understand whether the
+CURRENT PRICE looks attractive or whether waiting makes more sense, with
+special emphasis on the NEXT 3-7 TRADING DAYS.
+
+This is NOT an options-trading system. Do not use option-chain jargon unless
+you independently find a genuinely relevant event or source.
+
+You have been given structured market/fundamental data below. You ALSO have
+Google Search grounding available. Use Google Search aggressively for
+information that can have changed recently.
+
+RESEARCH REQUIREMENTS
+
+1. PRICE / TECHNICALS
+Analyze:
+- 1D, 5D, 20D and 60D price performance
+- 20D / 50D / 200D moving averages when available
+- RSI
+- ATR / volatility
+- recent 20D and 60D high/low
+- volume versus 20D average
+- relationship with NIFTY 50
+
+2. FUNDAMENTALS
+Analyze the available:
+- revenue / earnings growth
+- margins
+- ROE / ROA
+- debt
+- cash flow
+- valuation
+- dividend
+- sector / industry
+Do NOT invent missing numbers.
+
+3. CURRENT NEWS
+Search for important developments from roughly the last 7 days:
+- company announcements
+- exchange filings
+- earnings/results
+- management commentary
+- major contracts
+- acquisitions/divestments
+- regulatory developments
+- lawsuits or material controversies
+- analyst estimate changes when credible
+- sector-specific developments
+
+Prefer primary sources such as company/exchange/regulator filings, then
+high-quality financial news such as Reuters and other reputable outlets.
+
+4. MACRO / SECTOR
+Only include macro or geopolitical developments that are plausibly relevant
+to THIS company over the next few days.
+Examples can include:
+- crude oil
+- INR
+- interest rates
+- global risk sentiment
+- commodity prices
+- government policy
+- sector regulation
+Do not dump generic macro news.
+
+5. UPCOMING CATALYSTS
+Look for events in the next 1-2 weeks that could materially affect price:
+earnings, investor meetings, dividends, ex-dates, regulatory decisions,
+major announcements, etc.
+
+6. CONFLICT CHECK
+Explicitly identify when:
+- fundamentals are positive but short-term momentum is weak
+- price momentum is positive but valuation/news risk is high
+- market-wide conditions conflict with company-specific conditions
+
+7. SHORT-TERM ASSESSMENT
+Based on the evidence, classify the next 3-7 trading day setup as exactly
+one of:
+- BULLISH
+- BEARISH
+- MIXED
+
+Then give a confidence level:
+- LOW
+- MEDIUM
+- HIGH
+
+Do NOT claim certainty and do NOT invent a numerical probability.
+
+8. CURRENT-PRICE ASSESSMENT
+Classify the current price as exactly one of:
+- ATTRACTIVE
+- WAIT
+- ELEVATED RISK
+
+This is a research classification, not a guarantee of future returns.
+Explain the evidence behind it.
+
+9. INVALIDATION
+Give 2-4 concrete developments or price conditions that would make the
+current assessment less reliable.
+
+10. SOURCES
+At the end, list the most important sources with publisher + URL when
+available. Do not fabricate URLs.
 
 IMPORTANT:
-- This is research/analysis, not personalized financial advice.
-- Do not invent news or company developments.
-- Use current Google Search results for recent information.
-- Prefer primary sources, company filings, official government/
-  regulator sources, major financial publications, and established
-  news organizations.
-- Clearly distinguish confirmed facts from interpretation.
-- Consider the latest relevant geopolitical developments,
-  government/regulatory actions, macroeconomic conditions,
-  company policies, business developments, sector developments,
-  commodity/energy exposure, currency effects, trade restrictions,
-  sanctions, wars/conflicts, and supply-chain implications where
-  relevant to this asset.
-- Only discuss geopolitical factors that actually have a plausible
-  connection to this asset.
-- Do not treat a single news headline as proof of a market outcome.
-- Do not fabricate a target price.
-- Explain uncertainty.
+- Never invent current news.
+- Never pretend an old event is recent.
+- Separate documented facts from your interpretation.
+- If data conflicts, say so.
+- If information is missing, say "data unavailable".
+- Do not give a fake target price.
+- Do not use the word "guaranteed".
+- Keep the final answer concise enough for Telegram.
 
-QUANTITATIVE SCANNER DATA
--------------------------
-Asset: {metrics['Asset']}
-Spot: {metrics['Spot']}
-Expiry: {metrics['Expiry']}
-ATM: {metrics['ATM']}
-Strike Step: {metrics['Strike_Step']}
+OUTPUT FORMAT
 
-Zone:
-Low: {metrics['Zone_Low']}
-High: {metrics['Zone_High']}
+STOCK: <ticker>
+COMPANY: <name>
+AS OF: <timestamp>
 
-Resistance:
-Primary: {metrics['Resistance']}
-Volume-based: {metrics['Resistance_By_Volume']}
-OI-based: {metrics['Resistance_By_OI']}
-CE Max Volume: {metrics['CE_Max_Volume']}
-CE Max OI: {metrics['CE_Max_OI']}
-Strength: {metrics['Resistance_Strength']}
+SHORT-TERM (3-7 DAYS): <BULLISH / BEARISH / MIXED>
+CONFIDENCE: <LOW / MEDIUM / HIGH>
 
-Support:
-Primary: {metrics['Support']}
-Volume-based: {metrics['Support_By_Volume']}
-OI-based: {metrics['Support_By_OI']}
-PE Max Volume: {metrics['PE_Max_Volume']}
-PE Max OI: {metrics['PE_Max_OI']}
-Strength: {metrics['Support_Strength']}
+CURRENT PRICE: ₹...
+PRICE ASSESSMENT: <ATTRACTIVE / WAIT / ELEVATED RISK>
 
-PCR Volume: {metrics['PCR_Vol']}
-PCR OI: {metrics['PCR_OI']}
+WHY:
+• ...
+• ...
+• ...
 
-EOR: {metrics['EOR']}
-EOR Type: {metrics['EOR_Type']}
-EOR Status: {metrics['EOR_Status']}
+PRICE & MOMENTUM:
+• ...
+• ...
 
-EOS: {metrics['EOS']}
-EOS Type: {metrics['EOS_Type']}
-EOS Status: {metrics['EOS_Status']}
+FUNDAMENTALS:
+• ...
+• ...
 
-TASK
-----
+RECENT NEWS:
+POSITIVE:
+• ...
+NEGATIVE:
+• ...
 
-Produce a concise research report with exactly these sections:
+CATALYSTS:
+• ...
 
-1. OPTION-CHAIN READ
-Explain what the OI, volume, PCR, support, resistance, EOR
-and EOS are indicating.
+RISKS:
+• ...
 
-2. CURRENT COMPANY / BUSINESS DEVELOPMENTS
-Find relevant recent developments affecting the company or
-underlying asset.
+INVALIDATION:
+• ...
 
-3. MACRO + GEOPOLITICAL CONTEXT
-Find only relevant current geopolitical, regulatory,
-macroeconomic, trade, commodity, currency or supply-chain
-developments.
+BOTTOM LINE:
+2-4 concise sentences explaining the overall evidence.
 
-4. BULLISH FACTORS
-List the strongest factors supporting upside.
+SOURCES:
+• Publisher — URL
+• Publisher — URL
 
-5. BEARISH FACTORS
-List the strongest factors creating downside/risk.
-
-6. KEY LEVELS
-State the scanner's support, resistance, EOR and EOS levels
-and explain their meaning. Do not invent additional levels.
-
-7. SYNTHESIS
-Give a balanced interpretation of how the quantitative data
-and current information interact.
-
-8. WHAT WOULD INVALIDATE THIS VIEW
-List concrete events or market conditions that would make
-the current interpretation less useful.
-
-Keep the response Telegram-friendly and reasonably concise.
-Use INR/Indian-market terminology where appropriate.
+STRUCTURED DATA:
+{compact_json_safe(packet)}
 """
 
 
-def get_gemini_analysis(metrics):
-    """
-    Use Gemini + Google Search grounding for current information.
-    """
-
+def get_gemini_analysis(packet):
     if not GEMINI_API_KEY:
-        print(
-            "GEMINI_API_KEY is not configured. "
-            "Skipping Gemini analysis."
-        )
-        return ""
+        raise RuntimeError("GEMINI_API_KEY is not configured.")
 
-    try:
-        from google import genai
-        from google.genai import types
+    client = genai.Client(api_key=GEMINI_API_KEY)
 
-    except ImportError:
-        print(
-            "google-genai is not installed. "
-            "Skipping Gemini analysis."
-        )
-        return ""
+    grounding_tool = types.Tool(
+        google_search=types.GoogleSearch()
+    )
 
-    print("")
-    print("=" * 70)
-    print("RUNNING GEMINI RESEARCH")
-    print("=" * 70)
+    config = types.GenerateContentConfig(
+        tools=[grounding_tool],
+        temperature=0.2,
+    )
 
-    try:
+    prompt = build_gemini_prompt(packet)
 
-        client = genai.Client(
-            api_key=GEMINI_API_KEY
-        )
+    response = client.models.generate_content(
+        model=GEMINI_MODEL,
+        contents=prompt,
+        config=config,
+    )
 
-        prompt = build_gemini_prompt(
-            metrics
-        )
+    text = getattr(response, "text", None)
 
-        grounding_tool = types.Tool(
-            google_search=types.GoogleSearch()
-        )
+    if not text:
+        raise RuntimeError("Gemini returned an empty analysis.")
 
-        config = types.GenerateContentConfig(
-            tools=[
-                grounding_tool
-            ]
-        )
-
-        response = client.models.generate_content(
-            model=GEMINI_MODEL,
-            contents=prompt,
-            config=config,
-        )
-
-        text = getattr(
-            response,
-            "text",
-            None
-        )
-
-        if not text:
-            print(
-                "Gemini returned an empty response."
-            )
-            return ""
-
-        print(
-            "Gemini analysis generated successfully."
-        )
-
-        return text.strip()
-
-    except Exception as exc:
-
-        print(
-            "Gemini analysis failed:"
-        )
-
-        print(
-            f"{type(exc).__name__}: {exc}"
-        )
-
-        return ""
+    return text.strip()
 
 
 # ============================================================
@@ -1198,14 +774,9 @@ def get_gemini_analysis(metrics):
 
 def telegram_request(method, payload):
     if not TELEGRAM_BOT_TOKEN:
-        raise RuntimeError(
-            "TELEGRAM_BOT_TOKEN is missing."
-        )
+        raise RuntimeError("TELEGRAM_BOT_TOKEN is not configured.")
 
-    url = (
-        "https://api.telegram.org/bot"
-        f"{TELEGRAM_BOT_TOKEN}/{method}"
-    )
+    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/{method}"
 
     response = requests.post(
         url,
@@ -1218,179 +789,99 @@ def telegram_request(method, payload):
     data = response.json()
 
     if not data.get("ok"):
-        raise RuntimeError(
-            f"Telegram API error: {data}"
-        )
+        raise RuntimeError(f"Telegram API error: {data}")
 
     return data
 
 
-def send_telegram_message(
-    text,
-    parse_mode="HTML"
-):
-    """
-    Telegram has a message size limit.
-    Split long Gemini reports safely.
-    """
-
+def send_telegram_message(message):
     if not TELEGRAM_CHAT_ID:
-        raise RuntimeError(
-            "TELEGRAM_CHAT_ID is missing."
-        )
+        raise RuntimeError("TELEGRAM_CHAT_ID is not configured.")
 
-    max_length = 3900
-
-    chunks = []
-
-    while len(text) > max_length:
-
-        split_at = text.rfind(
-            "\n",
-            0,
-            max_length
-        )
-
-        if split_at < 1000:
-            split_at = max_length
-
-        chunks.append(
-            text[:split_at]
-        )
-
-        text = text[split_at:].lstrip()
-
-    if text:
-        chunks.append(text)
+    # Telegram message limit is 4096 characters.
+    # Keep a little room below the hard limit.
+    chunks = [
+        message[i:i + 3900]
+        for i in range(0, len(message), 3900)
+    ]
 
     for chunk in chunks:
-
         telegram_request(
             "sendMessage",
             {
                 "chat_id": TELEGRAM_CHAT_ID,
                 "text": chunk,
-                "parse_mode": parse_mode,
                 "disable_web_page_preview": True,
-            }
+            },
         )
 
-        time.sleep(0.5)
 
+def build_quant_snapshot(ticker, company_name, technical, fundamentals, benchmark, vix):
+    def yes_no(value):
+        if value is True:
+            return "YES"
+        if value is False:
+            return "NO"
+        return "N/A"
 
-# ============================================================
-# TELEGRAM MATRIX REPORT
-# ============================================================
+    return f"""
+INVESTOR DATA — {ticker}
+{company_name or ""}
 
-def send_matrix_telegram_alert(metrics):
-    """
-    Send the quantitative scanner result first.
-    Gemini research is sent separately afterwards.
-    """
+Price: ₹{fmt_num(technical.get("latest_price"))}
+1D: {fmt_pct(technical.get("return_1d"))}
+5D: {fmt_pct(technical.get("return_5d"))}
+20D: {fmt_pct(technical.get("return_20d"))}
+60D: {fmt_pct(technical.get("return_60d"))}
 
-    signal = (
-        "🟢 VOL BREAKOUT SUPPORTED"
-        if metrics["PCR_Vol"] > 1
-        else
-        "🔴 LIQUIDITY RESISTANCE BLOCKED"
-    )
+20D MA: ₹{fmt_num(technical.get("sma20"))}
+50D MA: ₹{fmt_num(technical.get("sma50"))}
+200D MA: ₹{fmt_num(technical.get("sma200"))}
 
-    message = f"""
-<b>OPTION CHAIN MATRIX</b>
+RSI(14): {fmt_num(technical.get("rsi14"))}
+ATR(14): ₹{fmt_num(technical.get("atr14"))}
+ATR %: {fmt_pct(technical.get("atr_pct"))}
 
-<b>Asset:</b> {html.escape(metrics["Asset"])}
-<b>Spot:</b> {format_number(metrics["Spot"])}
-<b>Expiry:</b> {html.escape(str(metrics["Expiry"]))}
+Volume / 20D avg: {fmt_num(technical.get("volume_ratio"))}x
+20D high: ₹{fmt_num(technical.get("high20"))}
+20D low: ₹{fmt_num(technical.get("low20"))}
 
-<b>ATM:</b> {format_number(metrics["ATM"])}
+Above 20D MA: {yes_no(technical.get("above_sma20"))}
+Above 50D MA: {yes_no(technical.get("above_sma50"))}
+Above 200D MA: {yes_no(technical.get("above_sma200"))}
 
-<b>Resistance:</b> {format_number(metrics["Resistance"])}
-<b>Support:</b> {format_number(metrics["Support"])}
+Sector: {fundamentals.get("sector") or "N/A"}
+Industry: {fundamentals.get("industry") or "N/A"}
+Market cap: {fmt_money(fundamentals.get("market_cap"))}
+P/E: {fmt_num(fundamentals.get("trailing_pe"))}
+Forward P/E: {fmt_num(fundamentals.get("forward_pe"))}
+P/B: {fmt_num(fundamentals.get("price_to_book"))}
+EV/EBITDA: {fmt_num(fundamentals.get("enterprise_to_ebitda"))}
+ROE: {fmt_pct(
+    fundamentals.get("return_on_equity") * 100
+    if fundamentals.get("return_on_equity") is not None
+    and abs(fundamentals.get("return_on_equity")) < 2
+    else fundamentals.get("return_on_equity")
+)}
+Revenue growth: {fmt_pct(
+    fundamentals.get("revenue_growth") * 100
+    if fundamentals.get("revenue_growth") is not None
+    and abs(fundamentals.get("revenue_growth")) < 2
+    else fundamentals.get("revenue_growth")
+)}
+Earnings growth: {fmt_pct(
+    fundamentals.get("earnings_growth") * 100
+    if fundamentals.get("earnings_growth") is not None
+    and abs(fundamentals.get("earnings_growth")) < 2
+    else fundamentals.get("earnings_growth")
+)}
+Debt/Equity: {fmt_num(fundamentals.get("debt_to_equity"))}
 
-<b>Resistance by Volume:</b>
-{format_number(metrics["Resistance_By_Volume"])}
-
-<b>Resistance by OI:</b>
-{format_number(metrics["Resistance_By_OI"])}
-
-<b>Support by Volume:</b>
-{format_number(metrics["Support_By_Volume"])}
-
-<b>Support by OI:</b>
-{format_number(metrics["Support_By_OI"])}
-
-<b>PCR Volume:</b> {metrics["PCR_Vol"]:.3f}
-<b>PCR OI:</b> {metrics["PCR_OI"]:.3f}
-
-<b>EOR:</b> {format_number(metrics["EOR"])}
-<b>EOS:</b> {format_number(metrics["EOS"])}
-
-<b>EOR Status:</b>
-{html.escape(metrics["EOR_Status"])}
-
-<b>EOS Status:</b>
-{html.escape(metrics["EOS_Status"])}
-
-<b>Scanner Signal:</b>
-{signal}
-
-<i>Quantitative NSE option-chain analysis.</i>
-"""
-
-    send_telegram_message(
-        message.strip()
-    )
-
-
-# ============================================================
-# TRAGEDY GUARD
-# ============================================================
-
-def tragedy_guard(metrics):
-    """
-    Basic sanity checks before sending the result.
-    """
-
-    required = [
-        "Spot",
-        "Resistance",
-        "Support",
-        "PCR_Vol",
-        "PCR_OI",
-        "EOR",
-        "EOS",
-    ]
-
-    for key in required:
-
-        value = metrics.get(key)
-
-        if value is None:
-            raise RuntimeError(
-                f"Missing metric: {key}"
-            )
-
-        if isinstance(value, float):
-
-            if math.isnan(value) or math.isinf(value):
-                raise RuntimeError(
-                    f"Invalid metric: {key}"
-                )
-
-    if metrics["Spot"] <= 0:
-        raise RuntimeError(
-            "Invalid spot price."
-        )
-
-    if metrics["Resistance"] <= 0:
-        raise RuntimeError(
-            "Invalid resistance."
-        )
-
-    if metrics["Support"] <= 0:
-        raise RuntimeError(
-            "Invalid support."
-        )
+NIFTY 1D: {fmt_pct(benchmark.get("nifty_1d")) if benchmark else "N/A"}
+NIFTY 5D: {fmt_pct(benchmark.get("nifty_5d")) if benchmark else "N/A"}
+NIFTY 20D: {fmt_pct(benchmark.get("nifty_20d")) if benchmark else "N/A"}
+INDIA VIX: {fmt_num(vix)}
+""".strip()
 
 
 # ============================================================
@@ -1398,182 +889,99 @@ def tragedy_guard(metrics):
 # ============================================================
 
 def main():
-
-    # --------------------------------------------------------
-    # Determine ticker
-    # --------------------------------------------------------
-
-    ticker = ""
-
-    if len(sys.argv) > 1:
-        ticker = sys.argv[1]
-
-    if not ticker:
-        ticker = os.getenv(
-            "TELEGRAM_INPUT_TICKER",
-            ""
-        )
-
-    ticker = clean_ticker(ticker)
-
-    if not ticker:
-        ticker = "NIFTY"
-
-    print("")
-    print("=" * 70)
-    print("ALGORITHMIC SCANNER")
-    print("=" * 70)
-
-    print(
-        f"Ticker: {ticker}"
+    raw_ticker = (
+        os.getenv("TELEGRAM_INPUT_TICKER")
+        or (sys.argv[1] if len(sys.argv) > 1 else "")
+        or "RELIANCE"
     )
 
-    # --------------------------------------------------------
-    # Select NSE API mode
-    # --------------------------------------------------------
+    ticker = clean_ticker(raw_ticker)
 
-    if ticker in INDEX_SYMBOLS:
+    print("=" * 70)
+    print(f"INVESTOR ENGINE — {ticker}")
+    print("=" * 70)
 
-        mode = "Indices"
+    print("Resolving market symbol...")
+    yahoo_symbol, stock = resolve_yahoo_ticker(ticker)
 
-        print(
-            "Index detected. "
-            "Using NSE Indices option chain."
-        )
+    print("Downloading price history...")
+    hist = stock.history(
+        period="1y",
+        interval="1d",
+        auto_adjust=False,
+    )
 
-    else:
+    technical = calculate_technical_snapshot(hist)
 
-        mode = "Equity"
+    print("Downloading company information...")
+    info = extract_info(stock)
 
-        print(
-            "Equity detected. "
-            "Using NSE Equity option chain."
-        )
+    print("Downloading financial statements...")
+    statements = get_financial_statement_snapshot(stock)
 
-    # --------------------------------------------------------
-    # Run matrix
-    # --------------------------------------------------------
+    fundamentals = calculate_fundamental_snapshot(
+        info,
+        statements,
+    )
+
+    print("Checking upcoming events...")
+    calendar = get_calendar_snapshot(stock)
+
+    print("Collecting recent Yahoo news...")
+    yahoo_news = get_yahoo_news(stock)
+
+    print("Checking NIFTY 50...")
+    benchmark = calculate_benchmark_snapshot()
+
+    print("Checking India VIX...")
+    vix = calculate_vix()
+
+    packet = build_research_packet(
+        ticker=ticker,
+        yahoo_symbol=yahoo_symbol,
+        technical=technical,
+        fundamentals=fundamentals,
+        benchmark=benchmark,
+        vix=vix,
+        calendar=calendar,
+        yahoo_news=yahoo_news,
+    )
+
+    # Send the raw quantitative snapshot first.
+    quantitative = build_quant_snapshot(
+        ticker=ticker,
+        company_name=fundamentals.get("company_name"),
+        technical=technical,
+        fundamentals=fundamentals,
+        benchmark=benchmark,
+        vix=vix,
+    )
+
+    print("\n" + quantitative + "\n")
 
     try:
+        send_telegram_message(quantitative)
+    except Exception as exc:
+        print(f"Telegram quantitative report failed: {exc}")
 
-        metrics = process_singularity_matrix(
-            ticker,
-            mode,
-        )
+    # Gemini handles the actual research synthesis.
+    print("Running Gemini + Google Search research...")
+    try:
+        analysis = get_gemini_analysis(packet)
 
-        tragedy_guard(
-            metrics
+        print("\n" + "=" * 70)
+        print("GEMINI INVESTOR ANALYSIS")
+        print("=" * 70)
+        print(analysis)
+
+        send_telegram_message(
+            "GEMINI INVESTOR ANALYSIS\n\n" + analysis
         )
 
     except Exception as exc:
-
-        print("")
-        print("=" * 70)
-        print("CORE API SYNC FAILURE")
-        print("=" * 70)
-
-        print(
-            f"{type(exc).__name__}: {exc}"
-        )
-
-        print(
-            "Matrix processing halted."
-        )
-
-        raise
-
-    # --------------------------------------------------------
-    # Send quantitative report
-    # --------------------------------------------------------
-
-    try:
-
-        print(
-            "Sending Telegram matrix report..."
-        )
-
-        send_matrix_telegram_alert(
-            metrics
-        )
-
-        print(
-            "Telegram matrix report sent."
-        )
-
-    except Exception as exc:
-
-        print(
-            "Telegram matrix report failed:"
-        )
-
-        print(
-            f"{type(exc).__name__}: {exc}"
-        )
-
-    # --------------------------------------------------------
-    # Gemini research
-    # --------------------------------------------------------
-
-    gemini_analysis = get_gemini_analysis(
-        metrics
-    )
-
-    if gemini_analysis:
-
-        print("")
-        print("=" * 70)
-        print("GEMINI ANALYSIS")
-        print("=" * 70)
-
-        print(
-            gemini_analysis
-        )
-
-        print("=" * 70)
-
-        try:
-
-            gemini_message = (
-                "<b>GEMINI MARKET RESEARCH</b>\n\n"
-                +
-                html.escape(
-                    gemini_analysis
-                )
-                +
-                "\n\n"
-                "<i>Research generated using "
-                "current web-grounded information. "
-                "Not financial advice.</i>"
-            )
-
-            send_telegram_message(
-                gemini_message
-            )
-
-            print(
-                "Gemini analysis sent to Telegram."
-            )
-
-        except Exception as exc:
-
-            print(
-                "Failed to send Gemini analysis:"
-            )
-
-            print(
-                f"{type(exc).__name__}: {exc}"
-            )
-
-    else:
-
-        print(
-            "No Gemini analysis available."
-        )
-
-    print("")
-    print("=" * 70)
-    print("SCAN COMPLETE")
-    print("=" * 70)
+        print(f"Gemini analysis failed: {type(exc).__name__}: {exc}")
+        # Do not hide the useful quantitative report if Gemini is temporarily
+        # unavailable. The workflow can still complete successfully.
 
 
 if __name__ == "__main__":
